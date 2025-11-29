@@ -1,0 +1,84 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Nodo Safety Map</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    html, body { margin: 0; padding: 0; height: 100%; }
+    #map { width: 100%; height: 100%; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+
+  <script>
+    alert("Nodo map js loaded!");  // 読み込まれているかチェック用
+
+    const map = L.map("map").setView([33.1478, 131.5215], 15);
+
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 19,
+    }).addTo(map);
+
+    function scoreToColor(score) {
+      const r = Math.floor(255 * score);
+      const g = Math.floor(255 * (1 - score));
+      return `rgb(${r},${g},0)`;
+    }
+
+    function styleByProps(feature) {
+      const p = feature.properties || {};
+
+      console.log(
+        "feat",
+        p.link_id,
+        "src=", p.source,
+        "cls=", p.gpt_class,
+        "conf=", p.confidence
+      );
+
+      // 1) GPS は青
+      if (p.source === "gps") {
+        return { color: "blue", weight: 5 };
+      }
+
+      // 2) 衛星 + FARMLANE + 信頼度0.8以上 = 赤
+      if (
+        p.source === "satellite" &&
+        p.gpt_class === "FARMLANE" &&
+        (parseFloat(p.confidence) || 0) >= 0.8
+      ) {
+        return { color: "red", weight: 4 };
+      }
+
+      // 3) それ以外の衛星 = 薄いグレー
+      if (p.source === "satellite") {
+        return { color: "#aaaaaa", weight: 1 };
+      }
+
+      // 4) その他は danger_score カラー（おまけ）
+      return {
+        color: scoreToColor(p.danger_score || 0),
+        weight: 3,
+      };
+    }
+
+    fetch("http://127.0.0.1:8000/api/roads/geojson")
+      .then((res) => res.json())
+      .then((data) => {
+        console.log("APIからの取得データ features数:", data.features.length);
+        L.geoJSON(data, {
+          style: styleByProps,
+        }).addTo(map);
+      })
+      .catch((err) => {
+        console.error("Fetch エラー:", err);
+      });
+  </script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+services:
+  db:
+    image: postgis/postgis:16-3.4
+    container_name: nodo-postgis
+    environment:
+      POSTGRES_DB: nodo
+      POSTGRES_USER: nodo
+      POSTGRES_PASSWORD: nodo_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./pgdata:/var/lib/postgresql/data
+    restart: unless-stopped

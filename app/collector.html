@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8" />
+  <title>Nodo Collector</title>
+  <link
+    rel="stylesheet"
+    href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
+  />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <style>
+    body, html { margin:0; padding:0; height:100%; }
+    #map { height:60%; }
+    #controls { padding:8px; }
+  </style>
+</head>
+<body>
+  <div id="map"></div>
+  <div id="controls">
+    <button id="startBtn">記録開始</button>
+    <button id="stopBtn" disabled>記録停止</button>
+
+    <div>
+      幅員(m): <input id="width" type="number" step="0.1" value="3">
+    </div>
+    <div>
+      ground_condition:
+      <select id="ground">
+        <option value="1">1: 良い</option>
+        <option value="2">2: やや悪い</option>
+        <option value="3" selected>3: 悪い</option>
+        <option value="4">4: かなり悪い</option>
+      </select>
+    </div>
+
+    <button id="sendBtn" disabled>サーバに送信</button>
+    <div id="status"></div>
+  </div>
+
+  <script>
+    const map = L.map("map").setView([33.1471, 131.5218], 16);
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 18,
+    }).addTo(map);
+
+    let watchId = null;
+    let points = [];
+    let polyline = null;
+
+    const startBtn = document.getElementById("startBtn");
+    const stopBtn  = document.getElementById("stopBtn");
+    const sendBtn  = document.getElementById("sendBtn");
+    const statusEl = document.getElementById("status");
+
+    startBtn.onclick = () => {
+      points = [];
+      if (polyline) {
+        map.removeLayer(polyline);
+        polyline = null;
+      }
+      statusEl.textContent = "GPS記録中...";
+      startBtn.disabled = true;
+      stopBtn.disabled = false;
+      sendBtn.disabled = true;
+
+      if (!navigator.geolocation) {
+        alert("この端末はGPSが使えません");
+        return;
+      }
+
+      watchId = navigator.geolocation.watchPosition(
+        (pos) => {
+          const lat = pos.coords.latitude;
+          const lng = pos.coords.longitude;
+          points.push({ lat, lng });
+
+          if (!polyline) {
+            polyline = L.polyline([[lat, lng]], { color: "blue" }).addTo(map);
+          } else {
+            polyline.addLatLng([lat, lng]);
+          }
+        },
+        (err) => {
+          console.error(err);
+          alert("位置情報が取得できません: " + err.message);
+        },
+        {
+          enableHighAccuracy: true,
+          maximumAge: 1000,
+          timeout: 10000,
+        }
+      );
+    };
+
+    stopBtn.onclick = () => {
+      if (watchId !== null) {
+        navigator.geolocation.clearWatch(watchId);
+        watchId = null;
+      }
+      statusEl.textContent = `記録停止：ポイント数 ${points.length}`;
+      startBtn.disabled = false;
+      stopBtn.disabled = true;
+      sendBtn.disabled = (points.length === 0);
+    };
+
+    sendBtn.onclick = async () => {
+      const width = parseFloat(document.getElementById("width").value);
+      const ground = parseInt(document.getElementById("ground").value, 10);
+
+      const payload = {
+        coords: points,             // [{lat,lng}, ...]
+        width_m: width,
+        slope_deg: null,            // フェーズ2で拡張
+        curvature: null,
+        visibility: null,
+        ground_condition: ground
+      };
+
+      try {
+        const res = await fetch("http://127.0.0.1:8000/api/roads", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await res.json();
+        console.log("登録結果:", data);
+        statusEl.textContent = `登録完了: link_id = ${data.link_id}`;
+        sendBtn.disabled = true;
+      } catch (e) {
+        console.error(e);
+        statusEl.textContent = "送信エラー";
+      }
+    };
+  </script>
+</body>
+</html>
