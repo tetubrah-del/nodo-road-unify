@@ -267,6 +267,7 @@ def map_page():
     let rawLayer = null;
     let unifiedLayer = null;
     let layerControl = null;
+    let dangerMode = false;
 
     function formatList(list) {
       if (!list || list.length === 0) return '-';
@@ -298,6 +299,26 @@ def map_page():
         return { color: '#888888', weight: 2 };
       }
       return { color: '#aaaaaa', weight: 2 };
+    }
+
+    function dangerColor(score) {
+      if (score === null || score === undefined) {
+        return '#000000'; // 未設定は黒
+      }
+      // スコアに応じて色分け（必要に応じて後で調整）
+      if (score < 2) return '#00cc66';     // 低リスク: 緑
+      if (score < 4) return '#ffcc00';     // 中リスク: 黄
+      if (score < 6) return '#ff8800';     // 高リスク: オレンジ
+      return '#ff0000';                    // 非常に危険: 赤
+    }
+
+    function unifiedStyle(feature) {
+      const p = feature.properties || {};
+      if (!dangerMode) {
+        return { color: '#000000', weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' };
+      }
+      const color = dangerColor(p.danger_score);
+      return { color, weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' };
     }
 
     function bindUnifiedPopup(layer, p) {
@@ -353,7 +374,7 @@ def map_page():
       }
 
       unifiedLayer = L.geoJSON(unifiedGeojson, {
-        style: { color: '#000000', weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' },
+        style: unifiedStyle,
         onEachFeature: (feature, layer) => bindUnifiedPopup(layer, feature.properties),
       }).addTo(map);
 
@@ -400,8 +421,33 @@ def map_page():
       legend.addTo(map);
     }
 
+    function addDangerToggle() {
+      const toggle = L.control({ position: 'topright' });
+      toggle.onAdd = function() {
+        const div = L.DomUtil.create('div', 'leaflet-bar');
+        div.style.background = 'white';
+        div.style.padding = '6px 8px';
+        div.style.fontSize = '14px';
+        div.style.lineHeight = '1.2';
+        const label = L.DomUtil.create('label', '', div);
+        const checkbox = L.DomUtil.create('input', '', label);
+        checkbox.type = 'checkbox';
+        checkbox.checked = dangerMode;
+        checkbox.style.marginRight = '6px';
+        label.appendChild(document.createTextNode('Danger mode'));
+        checkbox.addEventListener('change', (e) => {
+          dangerMode = e.target.checked;
+          loadLayers();
+        });
+        L.DomEvent.disableClickPropagation(div);
+        return div;
+      };
+      toggle.addTo(map);
+    }
+
     map.on('moveend', loadLayers);
     addLegend();
+    addDangerToggle();
     loadLayers();
   </script>
 </body>
