@@ -368,8 +368,8 @@ def map_page():
       };
       layerControl = L.control.layers(null, overlayMaps).addTo(map);
 
-      rawLayer.setZIndex(1);
-      unifiedLayer.setZIndex(2);
+      rawLayer.setZIndex(2);
+      unifiedLayer.setZIndex(1);
     }
 
     function addLegend() {
