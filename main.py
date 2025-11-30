@@ -264,8 +264,11 @@ def map_page():
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    let rawLayer = null;
+    let manualLayer = null;
+    let gpsLayer = null;
+    let satelliteLayer = null;
     let unifiedLayer = null;
+    let layerControl = null;
 
     function formatList(list) {
       if (!list || list.length === 0) return '-';
@@ -282,23 +285,43 @@ def map_page():
       return mapping[code] || '-';
     }
 
-    function bindUnifiedPopup(layer, properties) {
+    function rawStyle(feature) {
+      const p = feature.properties || {};
+      if (p.source === 'gps') {
+        return { color: '#0000ff', weight: 3 };
+      }
+      if (p.source === 'manual' || p.metadata_source === 'manual_mask_google_1km') {
+        return { color: '#ff0000', weight: 3 };
+      }
+      if (p.source === 'satellite') {
+        return { color: '#888888', weight: 2 };
+      }
+      return { color: '#888888', weight: 2 };
+    }
+
+    function bindUnifiedPopup(layer, p) {
       const html = [
-        `Unified link ${properties.link_id}`,
-        `Sources: ${formatList(properties.sources)}`,
-        `Parents: ${formatList(properties.parent_link_ids)}`,
-        `Width: ${formatNumber(properties.width_m, ' m')}`,
-        `Slope: ${formatNumber(properties.slope_deg, '°')}`,
-        `Ground: ${groundLabel(properties.ground_condition)}`,
-        `Danger score: ${properties.danger_score ?? '-'}`,
+        `<b>Unified link ${p.link_id}</b>`,
+        `Sources: ${formatList(p.sources)}`,
+        `Parents: ${formatList(p.parent_link_ids)}`,
+        `Width: ${formatNumber(p.width_m, ' m')}`,
+        `Slope: ${formatNumber(p.slope_deg, '°')}`,
+        `Curvature: ${formatNumber(p.curvature)}`,
+        `Visibility: ${formatNumber(p.visibility)}`,
+        `Ground: ${groundLabel(p.ground_condition)}`,
+        `Danger score: ${p.danger_score ?? '-'}`
       ].join('<br>');
       layer.bindPopup(html);
     }
 
-    function bindRawPopup(layer, properties) {
+    function bindRawPopup(layer, p) {
       const html = [
-        `Raw link ${properties.link_id}`,
-        `Danger score: ${properties.danger_score ?? '-'}`,
+        `<b>Raw link ${p.link_id}</b>`,
+        `Source: ${p.source || '-'}`,
+        `GPT class: ${p.gpt_class || '-'}`,
+        `Meta source: ${p.metadata_source || '-'}`,
+        `Width: ${formatNumber(p.width_m, ' m')}`,
+        `Danger score: ${p.danger_score ?? '-'}`
       ].join('<br>');
       layer.bindPopup(html);
     }
@@ -321,18 +344,62 @@ def map_page():
       const rawGeojson = await rawRes.json();
       const unifiedGeojson = await unifiedRes.json();
 
-      if (rawLayer) rawLayer.remove();
+      const manualFeatures = [];
+      const gpsFeatures = [];
+      const satelliteFeatures = [];
+
+      (rawGeojson.features || []).forEach((feature) => {
+        const p = feature.properties || {};
+        if (p.source === 'manual' || p.metadata_source === 'manual_mask_google_1km') {
+          manualFeatures.push(feature);
+        } else if (p.source === 'gps') {
+          gpsFeatures.push(feature);
+        } else if (p.source === 'satellite') {
+          satelliteFeatures.push(feature);
+        }
+      });
+
+      if (manualLayer) manualLayer.remove();
+      if (gpsLayer) gpsLayer.remove();
+      if (satelliteLayer) satelliteLayer.remove();
       if (unifiedLayer) unifiedLayer.remove();
+      if (layerControl) {
+        map.removeControl(layerControl);
+        layerControl = null;
+      }
+
+      manualLayer = L.geoJSON({ type: 'FeatureCollection', features: manualFeatures }, {
+        style: rawStyle,
+        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
+      }).addTo(map);
+
+      gpsLayer = L.geoJSON({ type: 'FeatureCollection', features: gpsFeatures }, {
+        style: rawStyle,
+        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
+      }).addTo(map);
+
+      satelliteLayer = L.geoJSON({ type: 'FeatureCollection', features: satelliteFeatures }, {
+        style: rawStyle,
+        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
+      }).addTo(map);
 
       unifiedLayer = L.geoJSON(unifiedGeojson, {
-        style: { color: '#0066ff', weight: 4 },
+        style: { color: '#000000', weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' },
         onEachFeature: (feature, layer) => bindUnifiedPopup(layer, feature.properties),
       }).addTo(map);
 
-      rawLayer = L.geoJSON(rawGeojson, {
-        style: { color: '#ff0000', weight: 3 },
-        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
-      }).addTo(map);
+      const overlayMaps = {
+        'Raw / Manual（手描き・赤）': manualLayer,
+        'Raw / GPS（青）': gpsLayer,
+        'Raw / Satellite FARMLANE（薄グレー）': satelliteLayer,
+        'Unified（統合レイヤー・黒）': unifiedLayer,
+      };
+      layerControl = L.control.layers(null, overlayMaps).addTo(map);
+
+      manualLayer.setZIndex(1);
+      gpsLayer.setZIndex(2);
+      satelliteLayer.setZIndex(3);
+      unifiedLayer.setZIndex(4);
     }
 
     function addLegend() {
@@ -340,8 +407,22 @@ def map_page():
       legend.onAdd = function() {
         const div = L.DomUtil.create('div', 'legend');
         div.innerHTML = `
-          <div class="legend-item"><span class="legend-line" style="background:#0066ff"></span><span>Unified roads</span></div>
-          <div class="legend-item"><span class="legend-line" style="background:#ff0000"></span><span>Raw roads</span></div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#000000"></span>
+            <span>Unified roads（統合レイヤー）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#ff0000"></span>
+            <span>Raw / Manual（手描き）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#0000ff"></span>
+            <span>Raw / GPS</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#888888"></span>
+            <span>Raw / Satellite FARMLANE</span>
+          </div>
         `;
         return div;
       };
