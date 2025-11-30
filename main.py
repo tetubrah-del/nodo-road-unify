@@ -352,14 +352,14 @@ def map_page():
         layerControl = null;
       }
 
-      rawLayer = L.geoJSON(rawGeojson, {
-        style: rawStyle,
-        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
-      }).addTo(map);
-
       unifiedLayer = L.geoJSON(unifiedGeojson, {
         style: { color: '#000000', weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' },
         onEachFeature: (feature, layer) => bindUnifiedPopup(layer, feature.properties),
+      }).addTo(map);
+
+      rawLayer = L.geoJSON(rawGeojson, {
+        style: rawStyle,
+        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
       }).addTo(map);
 
       const overlayMaps = {
@@ -368,8 +368,9 @@ def map_page():
       };
       layerControl = L.control.layers(null, overlayMaps).addTo(map);
 
-      rawLayer.setZIndex(1);
-      unifiedLayer.setZIndex(2);
+      unifiedLayer.setZIndex(1);
+      rawLayer.setZIndex(2);
+      rawLayer.bringToFront();
     }
 
     function addLegend() {
