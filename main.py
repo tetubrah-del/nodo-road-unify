@@ -415,6 +415,26 @@ def map_page():
             <span class="legend-line" style="background:#888888"></span>
             <span>Satellite（灰）</span>
           </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#00cc66"></span>
+            <span>Danger: 安全（緑）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#ffcc00"></span>
+            <span>Danger: 注意（黄）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#ff8800"></span>
+            <span>Danger: 危険（オレンジ）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#ff0000"></span>
+            <span>Danger: 非常に危険（赤）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#000000"></span>
+            <span>Danger: 未設定（黒）</span>
+          </div>
         `;
         return div;
       };
