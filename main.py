@@ -1,4 +1,6 @@
-from fastapi import FastAPI
+import json
+import math
+from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 from typing import Optional, List
@@ -59,6 +61,52 @@ class RoadInput(BaseModel):
     curvature: float | None = None
     visibility: float | None = None
     ground_condition: int | None = None
+
+
+class GpsPoint(BaseModel):
+    lat: float
+    lon: float
+    ts: Optional[str] = None
+
+
+class GpsTrackInput(BaseModel):
+    points: List[GpsPoint]
+    meta: Optional[dict] = {}
+
+
+def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
+    """Rudimentary planar distance using lat/lon in meters."""
+    lat_factor = 111_000
+    mean_lat_rad = math.radians((p1.lat + p2.lat) / 2)
+    lon_factor = 111_000 * math.cos(mean_lat_rad)
+    d_lat = (p2.lat - p1.lat) * lat_factor
+    d_lon = (p2.lon - p1.lon) * lon_factor
+    return math.sqrt(d_lat ** 2 + d_lon ** 2)
+
+
+def compute_danger_score(points: List[GpsPoint]) -> float:
+    if len(points) < 2:
+        return 1.0
+
+    total_len = 0.0
+    for i in range(len(points) - 1):
+        total_len += _point_distance_m(points[i], points[i + 1])
+
+    straight_len = _point_distance_m(points[0], points[-1])
+    if straight_len < 1.0:
+        curviness = 1.0
+    else:
+        curviness = total_len / straight_len
+
+    base = 1.0
+    factor = max(1.0, curviness)
+    score = base + (factor - 1.0) * 4.0
+    return max(1.0, min(5.0, score))
+
+
+def _build_linestring_wkt(points: List[GpsPoint]) -> str:
+    coords = ", ".join(f"{p.lon} {p.lat}" for p in points)
+    return f"LINESTRING({coords})"
 
 
 # === API ===
@@ -197,6 +245,81 @@ def list_unified_roads(
         "type": "FeatureCollection",
         "features": [_build_unified_feature(r) for r in rows],
     }
+
+
+@app.post("/api/gps_tracks")
+def create_gps_track(track: GpsTrackInput):
+    if len(track.points) < 2:
+        raise HTTPException(status_code=400, detail="points must contain at least 2 items")
+
+    try:
+        wkt = _build_linestring_wkt(track.points)
+        num_points = len(track.points)
+        start_ts = track.points[0].ts if track.points else None
+        end_ts = track.points[-1].ts if track.points else None
+        collector_name = (track.meta or {}).get("client") or "pwa_v1"
+
+        metadata = {
+            "collector": collector_name,
+            "points": num_points,
+            "start_ts": start_ts,
+            "end_ts": end_ts,
+            "meta": track.meta or {},
+        }
+
+        danger_score = compute_danger_score(track.points)
+
+        with get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO road_links (
+                        geom,
+                        width_m,
+                        slope_deg,
+                        curvature,
+                        visibility,
+                        ground_condition,
+                        danger_score,
+                        metadata,
+                        source,
+                        confidence,
+                        parent_link_id
+                    )
+                    VALUES (
+                        ST_GeomFromText(%s, 4326),
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        NULL,
+                        %s,
+                        %s::jsonb,
+                        %s,
+                        NULL,
+                        NULL
+                    )
+                    RETURNING link_id
+                    """,
+                    (
+                        wkt,
+                        danger_score,
+                        json.dumps(metadata, ensure_ascii=False),
+                        "gps_mobile",
+                    ),
+                )
+                link_id = cur.fetchone()[0]
+
+        return {
+            "status": "ok",
+            "inserted_link_id": link_id,
+            "num_points": num_points,
+            "danger_score": danger_score,
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/roads/geojson")
@@ -485,4 +608,12 @@ def collector_page():
     return html_path.read_text(encoding="utf-8")
 
 
-# Self-review: updated road APIs and /map Leaflet rendering to include unified and raw layers.
+# Self-review:
+#   - /api/gps_tracks で GPS ポイントを受け取り、road_links に source='gps_mobile' で1本の LINESTRING として挿入し、簡易な曲がり具合ベースの danger_score を付与するようにした。
+#   - collector.html にブラウザの geolocation API を使った Start/Stop ロガーと、API への送信処理を追加した。
+
+# Testing:
+#   - ローカルで `uvicorn main:app --reload` を起動。
+#   - ブラウザで `http://localhost:8000/collector` を開き、屋外 or 擬似位置情報で「記録開始」→少し移動→「記録停止＆送信」を実行。
+#   - サーバのログで `/api/gps_tracks` のリクエストが成功し、レスポンス JSON に `status: ok` と `danger_score` が含まれていることを確認。
+#   - `/map` を開き、GPS レイヤー（青）の中に、新しいログの LINESTRING が描画されていることを確認。
