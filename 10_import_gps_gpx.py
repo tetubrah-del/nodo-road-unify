@@ -4,6 +4,7 @@
 
 import argparse
 import json
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple
 import xml.etree.ElementTree as ET
@@ -14,8 +15,8 @@ from main import get_connection
 def is_gpx_file(path: Path) -> bool:
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
-            start = f.read(1024)
-        return start.lstrip().startswith("<gpx")
+            start = f.read(4096)
+        return re.search(r"<gpx[\s>]", start, flags=re.IGNORECASE) is not None
     except Exception:
         return False
 
