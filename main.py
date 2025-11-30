@@ -264,9 +264,7 @@ def map_page():
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    let manualLayer = null;
-    let gpsLayer = null;
-    let satelliteLayer = null;
+    let rawLayer = null;
     let unifiedLayer = null;
     let layerControl = null;
 
@@ -287,16 +285,19 @@ def map_page():
 
     function rawStyle(feature) {
       const p = feature.properties || {};
-      if (p.source === 'gps') {
-        return { color: '#0000ff', weight: 3 };
-      }
-      if (p.source === 'manual' || p.metadata_source === 'manual_mask_google_1km') {
+      const src = p.source;
+      const metaSrc = p.metadata_source;
+
+      if (src === 'manual' || metaSrc === 'manual_mask_google_1km') {
         return { color: '#ff0000', weight: 3 };
       }
-      if (p.source === 'satellite') {
+      if (src === 'gps') {
+        return { color: '#0000ff', weight: 3 };
+      }
+      if (src === 'satellite') {
         return { color: '#888888', weight: 2 };
       }
-      return { color: '#888888', weight: 2 };
+      return { color: '#aaaaaa', weight: 2 };
     }
 
     function bindUnifiedPopup(layer, p) {
@@ -344,41 +345,14 @@ def map_page():
       const rawGeojson = await rawRes.json();
       const unifiedGeojson = await unifiedRes.json();
 
-      const manualFeatures = [];
-      const gpsFeatures = [];
-      const satelliteFeatures = [];
-
-      (rawGeojson.features || []).forEach((feature) => {
-        const p = feature.properties || {};
-        if (p.source === 'manual' || p.metadata_source === 'manual_mask_google_1km') {
-          manualFeatures.push(feature);
-        } else if (p.source === 'gps') {
-          gpsFeatures.push(feature);
-        } else if (p.source === 'satellite') {
-          satelliteFeatures.push(feature);
-        }
-      });
-
-      if (manualLayer) manualLayer.remove();
-      if (gpsLayer) gpsLayer.remove();
-      if (satelliteLayer) satelliteLayer.remove();
+      if (rawLayer) rawLayer.remove();
       if (unifiedLayer) unifiedLayer.remove();
       if (layerControl) {
         map.removeControl(layerControl);
         layerControl = null;
       }
 
-      manualLayer = L.geoJSON({ type: 'FeatureCollection', features: manualFeatures }, {
-        style: rawStyle,
-        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
-      }).addTo(map);
-
-      gpsLayer = L.geoJSON({ type: 'FeatureCollection', features: gpsFeatures }, {
-        style: rawStyle,
-        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
-      }).addTo(map);
-
-      satelliteLayer = L.geoJSON({ type: 'FeatureCollection', features: satelliteFeatures }, {
+      rawLayer = L.geoJSON(rawGeojson, {
         style: rawStyle,
         onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
       }).addTo(map);
@@ -389,17 +363,13 @@ def map_page():
       }).addTo(map);
 
       const overlayMaps = {
-        'Raw / Manual（手描き・赤）': manualLayer,
-        'Raw / GPS（青）': gpsLayer,
-        'Raw / Satellite FARMLANE（薄グレー）': satelliteLayer,
+        'Raw（カラー分け）': rawLayer,
         'Unified（統合レイヤー・黒）': unifiedLayer,
       };
       layerControl = L.control.layers(null, overlayMaps).addTo(map);
 
-      manualLayer.setZIndex(1);
-      gpsLayer.setZIndex(2);
-      satelliteLayer.setZIndex(3);
-      unifiedLayer.setZIndex(4);
+      rawLayer.setZIndex(1);
+      unifiedLayer.setZIndex(2);
     }
 
     function addLegend() {
@@ -409,19 +379,19 @@ def map_page():
         div.innerHTML = `
           <div class="legend-item">
             <span class="legend-line" style="background:#000000"></span>
-            <span>Unified roads（統合レイヤー）</span>
+            <span>Unified（黒）</span>
           </div>
           <div class="legend-item">
             <span class="legend-line" style="background:#ff0000"></span>
-            <span>Raw / Manual（手描き）</span>
+            <span>Manual（赤）</span>
           </div>
           <div class="legend-item">
             <span class="legend-line" style="background:#0000ff"></span>
-            <span>Raw / GPS</span>
+            <span>GPS（青）</span>
           </div>
           <div class="legend-item">
             <span class="legend-line" style="background:#888888"></span>
-            <span>Raw / Satellite FARMLANE</span>
+            <span>Satellite（灰）</span>
           </div>
         `;
         return div;
