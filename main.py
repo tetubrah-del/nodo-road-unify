@@ -285,6 +285,20 @@ def map_page():
       return mapping[code] || '-';
     }
 
+    function rawStyle(feature) {
+      const p = feature.properties || {};
+      if (p.source === 'gps') {
+        return { color: '#0000ff', weight: 3 };
+      }
+      if (p.source === 'manual' || p.metadata_source === 'manual_mask_google_1km') {
+        return { color: '#ff0000', weight: 3 };
+      }
+      if (p.source === 'satellite') {
+        return { color: '#888888', weight: 2 };
+      }
+      return { color: '#888888', weight: 2 };
+    }
+
     function bindUnifiedPopup(layer, p) {
       const html = [
         `<b>Unified link ${p.link_id}</b>`,
@@ -355,17 +369,17 @@ def map_page():
       }
 
       manualLayer = L.geoJSON({ type: 'FeatureCollection', features: manualFeatures }, {
-        style: { color: '#ff0000', weight: 3 },
+        style: rawStyle,
         onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
       }).addTo(map);
 
       gpsLayer = L.geoJSON({ type: 'FeatureCollection', features: gpsFeatures }, {
-        style: { color: '#0000ff', weight: 3 },
+        style: rawStyle,
         onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
       }).addTo(map);
 
       satelliteLayer = L.geoJSON({ type: 'FeatureCollection', features: satelliteFeatures }, {
-        style: { color: '#888888', weight: 2 },
+        style: rawStyle,
         onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
       }).addTo(map);
 
