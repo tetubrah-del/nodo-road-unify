@@ -1,11 +1,12 @@
 """Compute provisional danger_score for road link tables."""
 
 import argparse
-import os
 
 import psycopg2
 import psycopg2.extras
 from psycopg2 import sql
+
+from main import get_connection
 
 
 def bucket(value, thresholds):
@@ -74,16 +75,6 @@ def parse_args():
         help="Target table name (default: road_links_unified)",
     )
     return parser.parse_args()
-
-
-def get_connection():
-    return psycopg2.connect(
-        host=os.getenv("PG_HOST"),
-        port=os.getenv("PG_PORT"),
-        dbname=os.getenv("PG_DB"),
-        user=os.getenv("PG_USER"),
-        password=os.getenv("PG_PASS"),
-    )
 
 
 def main():
