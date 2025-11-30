@@ -320,7 +320,8 @@ def map_page():
       attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
 
-    let roadsLayer = null;
+    const rawLayer = L.layerGroup().addTo(map);
+    const unifiedLayer = L.layerGroup().addTo(map);
 
     function styleByProps(p) {
   // ① 手書き農道：metadata_source が manual_mask_google_1km
@@ -362,11 +363,9 @@ def map_page():
       const res = await fetch('/api/roads?' + params.toString());
       const geojson = await res.json();
 
-      if (roadsLayer) {
-        roadsLayer.remove();
-      }
+      rawLayer.clearLayers();
 
-      roadsLayer = L.geoJSON(geojson, {
+      L.geoJSON(geojson, {
         style: (feature) => styleByProps(feature.properties),
         onEachFeature: (feature, layer) => {
           const p = feature.properties;
@@ -378,11 +377,32 @@ def map_page():
             '<br>curvature: ' + (p.curvature ?? 'N/A')
           );
         }
-      }).addTo(map);
+      }).addTo(rawLayer);
     }
 
     map.on('moveend', loadRoads);
     loadRoads();
+
+    fetch('/api/road_links_unified')
+      .then(res => res.json())
+      .then(fc => {
+        L.geoJSON(fc, {
+          style: {
+            color: 'black',
+            weight: 5,
+            opacity: 0.9
+          }
+        }).addTo(unifiedLayer);
+      });
+
+    L.control.layers(
+      {
+        'Raw roads': rawLayer,
+        'Unified roads': unifiedLayer
+      },
+      {},
+      { collapsed: false }
+    ).addTo(map);
   </script>
 </body>
 </html>
@@ -529,6 +549,53 @@ LIMIT %s
                 "danger_score": danger_score,
             },
         })
+
+    return JSONResponse({
+        "type": "FeatureCollection",
+        "features": features,
+    })
+
+
+@app.get("/api/road_links_unified")
+def list_road_links_unified():
+    with get_conn() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    link_id,
+                    width_m,
+                    sources,
+                    parent_link_ids,
+                    danger_score,
+                    metadata,
+                    ST_AsGeoJSON(geom)::json AS geom
+                FROM road_links_unified
+                ORDER BY link_id
+                """
+            )
+            rows = cur.fetchall()
+
+    features = []
+    for r in rows:
+        properties = {
+            "link_id": r["link_id"],
+            "width_m": r.get("width_m"),
+            "sources": r.get("sources"),
+            "parent_link_ids": r.get("parent_link_ids"),
+            "danger_score": r.get("danger_score"),
+        }
+
+        if r.get("metadata"):
+            properties.update(r["metadata"])
+
+        features.append(
+            {
+                "type": "Feature",
+                "geometry": r["geom"],
+                "properties": properties,
+            }
+        )
 
     return JSONResponse({
         "type": "FeatureCollection",
