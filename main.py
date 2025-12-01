@@ -2,12 +2,13 @@ import json
 import math
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from typing import Optional, List
 from pathlib import Path
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from danger_score import compute_danger_score as compute_meta_danger_score
 
 # Run: uvicorn main:app --reload
 
@@ -74,6 +75,26 @@ class GpsTrackInput(BaseModel):
     meta: Optional[dict] = {}
 
 
+class CollectorPoint(BaseModel):
+    lat: float
+    lon: float
+    timestamp_ms: Optional[int] = None
+
+
+class CollectorMeta(BaseModel):
+    width_m: Optional[float] = None
+    slope_deg: Optional[float] = None
+    curvature: Optional[float] = None
+    visibility: Optional[float] = None
+    ground_condition: Optional[int] = None
+    note: Optional[str] = None
+
+
+class CollectorRequest(BaseModel):
+    points: List[CollectorPoint]
+    meta: CollectorMeta = Field(default_factory=CollectorMeta)
+
+
 def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
     """Rudimentary planar distance using lat/lon in meters."""
     lat_factor = 111_000
@@ -84,7 +105,7 @@ def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
     return math.sqrt(d_lat ** 2 + d_lon ** 2)
 
 
-def compute_danger_score(points: List[GpsPoint]) -> float:
+def compute_track_danger_score(points: List[GpsPoint]) -> float:
     if len(points) < 2:
         return 1.0
 
@@ -104,7 +125,7 @@ def compute_danger_score(points: List[GpsPoint]) -> float:
     return max(1.0, min(5.0, score))
 
 
-def _build_linestring_wkt(points: List[GpsPoint]) -> str:
+def _build_linestring_wkt(points) -> str:
     coords = ", ".join(f"{p.lon} {p.lat}" for p in points)
     return f"LINESTRING({coords})"
 
@@ -247,6 +268,76 @@ def list_unified_roads(
     }
 
 
+@app.post("/api/collector/submit")
+def collector_submit(payload: CollectorRequest):
+    if not payload.points or len(payload.points) < 2:
+        raise HTTPException(status_code=400, detail="At least 2 points are required")
+
+    danger_score = compute_meta_danger_score(
+        width_m=payload.meta.width_m,
+        slope_deg=payload.meta.slope_deg,
+        curvature=payload.meta.curvature,
+        visibility=payload.meta.visibility,
+        ground_condition=payload.meta.ground_condition,
+    )
+
+    wkt = _build_linestring_wkt(payload.points)
+    meta_payload = payload.meta.dict()
+    metadata = {
+        "collector": "web_pwa",
+        "num_points": len(payload.points),
+        "meta": meta_payload,
+        "raw_points": [p.dict() for p in payload.points],
+    }
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                INSERT INTO road_links (
+                    geom,
+                    source,
+                    width_m,
+                    slope_deg,
+                    curvature,
+                    visibility,
+                    ground_condition,
+                    danger_score,
+                    metadata
+                )
+                VALUES (
+                    ST_GeomFromText(%s, 4326),
+                    %s, %s, %s, %s, %s, %s, %s,
+                    %s::jsonb
+                )
+                RETURNING link_id, danger_score;
+                """,
+                (
+                    wkt,
+                    "gps",
+                    payload.meta.width_m,
+                    payload.meta.slope_deg,
+                    payload.meta.curvature,
+                    payload.meta.visibility,
+                    payload.meta.ground_condition,
+                    danger_score,
+                    json.dumps(metadata, ensure_ascii=False),
+                ),
+            )
+            row = cur.fetchone()
+
+    print(
+        f"[collector] points={len(payload.points)} danger_score={danger_score} "
+        f"link_id={row['link_id']}"
+    )
+
+    return {
+        "status": "ok",
+        "link_id": row["link_id"],
+        "danger_score": row["danger_score"],
+    }
+
+
 @app.post("/api/gps_tracks")
 def create_gps_track(track: GpsTrackInput):
     if len(track.points) < 2:
@@ -267,7 +358,7 @@ def create_gps_track(track: GpsTrackInput):
             "meta": track.meta or {},
         }
 
-        danger_score = compute_danger_score(track.points)
+        danger_score = compute_track_danger_score(track.points)
 
         with get_connection() as conn:
             with conn.cursor() as cur:

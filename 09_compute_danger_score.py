@@ -6,63 +6,8 @@ import psycopg2
 import psycopg2.extras
 from psycopg2 import sql
 
+from danger_score import compute_danger_score
 from main import get_connection
-
-
-def bucket(value, thresholds):
-    """閾値リストに基づいて 0〜len(thresholds) のスコアを返すヘルパー。
-    value が None の場合は最大スコアを返す。"""
-    if value is None:
-        return len(thresholds)
-    for i, th in enumerate(thresholds):
-        if value < th:
-            return i
-    return len(thresholds)
-
-
-def compute_danger_score(row):
-    width = row["width_m"]
-    slope = row["slope_deg"]
-    curv = row["curvature"]
-    vis = row["visibility"]
-    ground = row["ground_condition"]
-
-    # 幅: 狭いほど危険
-    width_score = bucket(width, [3.5, 3.0, 2.5, 2.0])
-
-    # 勾配: 急なほど危険
-    slope_score = bucket(slope, [5, 8, 12, 16])
-
-    # カーブ: 大きいほど危険
-    curvature_score = bucket(curv, [0.1, 0.2, 0.3, 0.4])
-
-    # 見通し: 低いほど危険（visibility は 0〜1 を想定）
-    if vis is None:
-        visibility_score = 4
-    else:
-        # 高いほど安全なので 1 - vis で反転させてから bucket
-        visibility_score = bucket(1.0 - vis, [0.2, 0.4, 0.6, 0.8])
-
-    # 路面状態: 1〜4（良→悪）。None は 3 とみなす。
-    if ground is None:
-        ground = 3
-    ground_score = float(ground)  # そのまま使う（最大 4）
-
-    raw_total = (
-        width_score * 1.0
-        + slope_score * 1.2
-        + curvature_score * 1.2
-        + visibility_score * 1.0
-        + ground_score * 0.8
-    )
-
-    danger = 1.0 + raw_total / 3.0
-    # 1.0〜8.0 にクリップ
-    if danger < 1.0:
-        danger = 1.0
-    if danger > 8.0:
-        danger = 8.0
-    return round(danger, 1)
 
 
 def parse_args():
@@ -101,7 +46,16 @@ def main():
             rows = cur.fetchall()
 
             updates = [
-                (compute_danger_score(row), row["link_id"])
+                (
+                    compute_danger_score(
+                        width_m=row.get("width_m"),
+                        slope_deg=row.get("slope_deg"),
+                        curvature=row.get("curvature"),
+                        visibility=row.get("visibility"),
+                        ground_condition=row.get("ground_condition"),
+                    ),
+                    row["link_id"],
+                )
                 for row in rows
             ]
 

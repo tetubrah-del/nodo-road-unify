@@ -25,6 +25,11 @@
     </div>
     <div id="points-count">記録ポイント数: 0</div>
     <div id="status">待機中</div>
+    <label style="font-size:12px; color:#555; display:flex; flex-direction:column; gap:4px;">
+      メモ (任意)
+      <textarea id="note" rows="2" style="width:100%;"></textarea>
+    </label>
+    <div id="error" style="color:#b00020; font-size:13px;"></div>
     <div style="font-size:12px; color:#777;">ブラウザの位置情報を許可してから記録してください。</div>
   </div>
 
@@ -42,6 +47,16 @@
     const stopSendBtn  = document.getElementById("stopSendBtn");
     const statusEl = document.getElementById("status");
     const pointsCountEl = document.getElementById("points-count");
+    const noteEl = document.getElementById("note");
+    const errorEl = document.getElementById("error");
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function setError(text) {
+      errorEl.textContent = text || '';
+    }
 
     function updatePointsCount() {
       pointsCountEl.textContent = `記録ポイント数: ${recordedPoints.length}`;
@@ -64,7 +79,7 @@
 
       if (!navigator.geolocation) {
         alert("この端末はGPSが使えません");
-        statusEl.textContent = "GPS非対応";
+        setStatus("GPS非対応");
         startBtn.disabled = false;
         stopSendBtn.disabled = true;
         return;
@@ -74,7 +89,7 @@
         (pos) => {
           const lat = pos.coords.latitude;
           const lon = pos.coords.longitude;
-          const point = { lat, lon, ts: new Date().toISOString() };
+          const point = { lat, lon, timestamp_ms: Date.now() };
           recordedPoints.push(point);
           updatePointsCount();
 
@@ -104,28 +119,34 @@
 
       if (recordedPoints.length < 2) {
         alert("2ポイント以上記録してから送信してください");
-        statusEl.textContent = "記録が少なすぎます";
+        setStatus("記録が少なすぎます");
         startBtn.disabled = false;
         stopSendBtn.disabled = true;
         return;
       }
 
-      statusEl.textContent = "送信中...";
+      setStatus("送信中...");
       try {
-        const res = await fetch('/api/gps_tracks', {
+        setError('');
+        const res = await fetch('/api/collector/submit', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ points: recordedPoints, meta: { client: 'pwa_v1' } })
+          body: JSON.stringify({
+            points: recordedPoints,
+            meta: { note: noteEl.value || undefined },
+          }),
         });
-        const data = await res.json();
+        const data = await res.json().catch(() => ({}));
         if (!res.ok) {
           throw new Error(data.detail || '送信に失敗しました');
         }
-        statusEl.textContent = `送信完了。link_id=${data.inserted_link_id}, danger_score=${data.danger_score}`;
+        setStatus(`送信完了。link_id=${data.link_id}, danger_score=${data.danger_score}`);
+        alert('送信しました');
         resetRecording();
       } catch (e) {
         console.error(e);
-        statusEl.textContent = "送信エラー: " + e.message;
+        setStatus("送信エラー");
+        setError(e.message);
       }
 
       startBtn.disabled = false;
@@ -134,13 +155,13 @@
   </script>
 
   <!-- Self-review:
-       - /api/gps_tracks で GPS ポイントを受け取り、road_links に source='gps_mobile' で1本の LINESTRING として挿入し、簡易な曲がり具合ベースの danger_score を付与するようにした。
+       - /api/collector/submit に GPS ポイントを送信し、road_links に source='gps' で LINESTRING を挿入し、meta から danger_score を付与するようにした。
        - collector.html にブラウザの geolocation API を使った Start/Stop ロガーと、API への送信処理を追加した。
 
        Testing:
        - ローカルで `uvicorn main:app --reload` を起動。
        - ブラウザで `http://localhost:8000/collector` を開き、屋外 or 擬似位置情報で「記録開始」→少し移動→「記録停止＆送信」を実行。
-       - サーバのログで `/api/gps_tracks` のリクエストが成功し、レスポンス JSON に `status: ok` と `danger_score` が含まれていることを確認。
+       - サーバのログで `/api/collector/submit` のリクエストが成功し、レスポンス JSON に `status: ok` と `danger_score` が含まれていることを確認。
        - `/map` を開き、GPS レイヤー（青）の中に、新しいログの LINESTRING が描画されていることを確認。
   -->
 </body>
