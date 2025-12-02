@@ -503,6 +503,9 @@ def map_page():
       const src = p.source;
       const metaSrc = p.metadata_source;
 
+      if (p.link_id === 48889) {
+        return { color: '#00ffff', weight: 8 };
+      }
       if (src === 'manual' || metaSrc === 'manual_mask_google_1km') {
         return { color: '#ff0000', weight: 3 };
       }
