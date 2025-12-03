@@ -14,6 +14,8 @@
     #controls { padding:12px; background:#f5f5f5; display:flex; flex-direction:column; gap:8px; }
     #status { font-weight:bold; color:#333; }
     #points-count { font-size:14px; color:#555; }
+    .toggle-row { display:flex; align-items:center; gap:8px; font-size:14px; }
+    .toggle-row input { transform: scale(1.2); }
   </style>
 </head>
 <body>
@@ -25,6 +27,11 @@
     </div>
     <div id="points-count">記録ポイント数: 0</div>
     <div id="status">待機中</div>
+    <label class="toggle-row">
+      <input type="checkbox" id="sensorToggle" />
+      車両固定モード（センサー ON/OFF）
+    </label>
+    <div id="sensor-status" style="font-size:12px; color:#555;"></div>
     <label style="font-size:12px; color:#555; display:flex; flex-direction:column; gap:4px;">
       メモ (任意)
       <textarea id="note" rows="2" style="width:100%;"></textarea>
@@ -49,6 +56,145 @@
     const pointsCountEl = document.getElementById("points-count");
     const noteEl = document.getElementById("note");
     const errorEl = document.getElementById("error");
+    const sensorToggle = document.getElementById("sensorToggle");
+    const sensorStatusEl = document.getElementById("sensor-status");
+
+    function createSensorTracker() {
+      let enabled = false;
+      let sessionActive = false;
+      let listenersAttached = false;
+      let sumSquares = 0;
+      let maxAbs = 0;
+      let sampleCount = 0;
+      let pitchSum = 0;
+      let pitchCount = 0;
+      let lastPitchDeg = null;
+
+      const resetStats = () => {
+        sumSquares = 0;
+        maxAbs = 0;
+        sampleCount = 0;
+        pitchSum = 0;
+        pitchCount = 0;
+      };
+
+      const handleOrientation = (event) => {
+        if (typeof event.beta === 'number') {
+          lastPitchDeg = event.beta;
+        }
+      };
+
+      const handleMotion = (event) => {
+        if (!sessionActive) return;
+        const acc = event.accelerationIncludingGravity || event.acceleration;
+        if (!acc || typeof acc.z !== 'number') return;
+        const vertical = acc.z;
+        const absVal = Math.abs(vertical);
+        sumSquares += vertical * vertical;
+        sampleCount += 1;
+        if (sampleCount === 1) {
+          maxAbs = absVal;
+        } else {
+          maxAbs = Math.max(maxAbs, absVal);
+        }
+
+        if (typeof lastPitchDeg === 'number') {
+          pitchSum += lastPitchDeg;
+          pitchCount += 1;
+        }
+      };
+
+      const attachListeners = () => {
+        if (listenersAttached) return;
+        window.addEventListener('devicemotion', handleMotion);
+        window.addEventListener('deviceorientation', handleOrientation);
+        listenersAttached = true;
+        console.log('[sensor] listeners attached');
+      };
+
+      const detachListeners = () => {
+        if (!listenersAttached) return;
+        window.removeEventListener('devicemotion', handleMotion);
+        window.removeEventListener('deviceorientation', handleOrientation);
+        listenersAttached = false;
+        console.log('[sensor] listeners detached');
+      };
+
+      const ensurePermission = async () => {
+        if (typeof DeviceMotionEvent === 'undefined') {
+          console.warn('[sensor] DeviceMotionEvent not available');
+          return false;
+        }
+
+        // iOS Safari requires an explicit permission request
+        if (typeof DeviceMotionEvent.requestPermission === 'function') {
+          try {
+            const resp = await DeviceMotionEvent.requestPermission();
+            return resp === 'granted';
+          } catch (e) {
+            console.warn('[sensor] permission request failed', e);
+            return false;
+          }
+        }
+        return true;
+      };
+
+      const enable = async () => {
+        const permitted = await ensurePermission();
+        enabled = permitted;
+        if (enabled) {
+          attachListeners();
+        } else {
+          detachListeners();
+        }
+        return enabled;
+      };
+
+      const disable = () => {
+        enabled = false;
+        detachListeners();
+      };
+
+      const startSession = () => {
+        resetStats();
+        sessionActive = true;
+        if (enabled) {
+          attachListeners();
+        }
+      };
+
+      const stopSession = () => {
+        sessionActive = false;
+      };
+
+      const getSummary = () => {
+        if (sampleCount === 0) {
+          return {
+            mode: 'off',
+            vertical_rms: null,
+            vertical_max: null,
+            pitch_mean_deg: null,
+            sensor_samples: 0,
+          };
+        }
+
+        const vertical_rms = Math.sqrt(sumSquares / sampleCount);
+        const vertical_max = maxAbs;
+        const pitch_mean_deg = pitchCount > 0 ? pitchSum / pitchCount : null;
+
+        return {
+          mode: 'vehicle',
+          vertical_rms,
+          vertical_max,
+          pitch_mean_deg,
+          sensor_samples: sampleCount,
+        };
+      };
+
+      return { enable, disable, startSession, stopSession, getSummary };
+    }
+
+    const sensorTracker = createSensorTracker();
 
     function setStatus(text) {
       statusEl.textContent = text;
@@ -71,17 +217,41 @@
       }
     }
 
+    async function toggleSensors(checked) {
+      if (checked) {
+        const ok = await sensorTracker.enable();
+        if (ok) {
+          sensorStatusEl.textContent = 'センサー計測中 (車両固定モード)';
+        } else {
+          sensorToggle.checked = false;
+          sensorStatusEl.textContent = 'センサー非対応、または許可が必要です';
+        }
+      } else {
+        sensorTracker.disable();
+        sensorStatusEl.textContent = 'センサーOFF（GPSのみ）';
+      }
+    }
+
+    sensorToggle.addEventListener('change', (e) => {
+      toggleSensors(e.target.checked);
+    });
+
+    // Initialize sensor status on load
+    sensorStatusEl.textContent = 'センサーOFF（GPSのみ）';
+
     startBtn.onclick = () => {
       resetRecording();
       statusEl.textContent = "GPS記録中...";
       startBtn.disabled = true;
       stopSendBtn.disabled = false;
+      sensorTracker.startSession();
 
       if (!navigator.geolocation) {
         alert("この端末はGPSが使えません");
         setStatus("GPS非対応");
         startBtn.disabled = false;
         stopSendBtn.disabled = true;
+        sensorTracker.stopSession();
         return;
       }
 
@@ -117,6 +287,8 @@
         watchId = null;
       }
 
+      sensorTracker.stopSession();
+
       if (recordedPoints.length < 2) {
         alert("2ポイント以上記録してから送信してください");
         setStatus("記録が少なすぎます");
@@ -133,6 +305,7 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             points: recordedPoints,
+            sensor_summary: sensorTracker.getSummary(),
             meta: { note: noteEl.value || undefined },
           }),
         });
@@ -151,6 +324,7 @@
 
       startBtn.disabled = false;
       stopSendBtn.disabled = true;
+      sensorTracker.stopSession();
     };
   </script>
 
