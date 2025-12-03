@@ -168,7 +168,7 @@
       };
 
       const getSummary = () => {
-        if (sampleCount === 0) {
+        if (!enabled) {
           return {
             mode: 'off',
             vertical_rms: null,
@@ -178,8 +178,8 @@
           };
         }
 
-        const vertical_rms = Math.sqrt(sumSquares / sampleCount);
-        const vertical_max = maxAbs;
+        const vertical_rms = sampleCount > 0 ? Math.sqrt(sumSquares / sampleCount) : null;
+        const vertical_max = sampleCount > 0 ? maxAbs : null;
         const pitch_mean_deg = pitchCount > 0 ? pitchSum / pitchCount : null;
 
         return {
