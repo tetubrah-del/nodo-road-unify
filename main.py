@@ -3,7 +3,7 @@ import math
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
-from typing import Optional, List
+from typing import Optional, List, Literal
 from pathlib import Path
 import os
 import psycopg2
@@ -90,9 +90,18 @@ class CollectorMeta(BaseModel):
     note: Optional[str] = None
 
 
+class CollectorSensorSummary(BaseModel):
+    mode: Literal["vehicle", "off"]
+    vertical_rms: Optional[float] = None
+    vertical_max: Optional[float] = None
+    pitch_mean_deg: Optional[float] = None
+    sensor_samples: int
+
+
 class CollectorRequest(BaseModel):
     points: List[CollectorPoint]
     meta: CollectorMeta = Field(default_factory=CollectorMeta)
+    sensor_summary: Optional[CollectorSensorSummary] = None
 
 
 def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
@@ -128,6 +137,21 @@ def compute_track_danger_score(points: List[GpsPoint]) -> float:
 def _build_linestring_wkt(points) -> str:
     coords = ", ".join(f"{p.lon} {p.lat}" for p in points)
     return f"LINESTRING({coords})"
+
+
+def _build_collector_metadata(payload: CollectorRequest) -> dict:
+    meta_payload = payload.meta.dict() if payload.meta else {}
+    metadata = {
+        "collector": "web_pwa",
+        "num_points": len(payload.points),
+        "meta": meta_payload,
+        "raw_points": [p.dict() for p in payload.points],
+    }
+
+    if payload.sensor_summary is not None:
+        metadata["sensor_summary"] = payload.sensor_summary.dict()
+
+    return metadata
 
 
 # === API ===
@@ -282,13 +306,7 @@ def collector_submit(payload: CollectorRequest):
     )
 
     wkt = _build_linestring_wkt(payload.points)
-    meta_payload = payload.meta.dict()
-    metadata = {
-        "collector": "web_pwa",
-        "num_points": len(payload.points),
-        "meta": meta_payload,
-        "raw_points": [p.dict() for p in payload.points],
-    }
+    metadata = _build_collector_metadata(payload)
 
     with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
