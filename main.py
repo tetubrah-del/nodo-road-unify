@@ -8,6 +8,7 @@ from pathlib import Path
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from psycopg2.extensions import connection as PGConnection
 from danger_score_utils import compute_danger_score_v2
 
 # Run: uvicorn main:app --reload
@@ -152,6 +153,67 @@ def _build_collector_metadata(payload: CollectorRequest) -> dict:
         metadata["sensor_summary"] = payload.sensor_summary.dict()
 
     return metadata
+
+
+def snap_linestring_to_unified_roads(
+    conn: PGConnection,
+    wkt: str,
+    search_radius_m: float = 100.0,
+    snap_tolerance_m: float = 8.0,
+) -> str:
+    """
+    Try to snap the given LINESTRING (in WKT, SRID 4326) to nearby
+    road_links_unified geometries.
+
+    - First, compute a small search envelope around the input geometry
+      (bbox expanded by `search_radius_m`).
+    - Within that envelope, collect candidate centerlines from road_links_unified.
+    - If there are no candidates, just return the original WKT.
+    - Otherwise, build a union geometry of those candidates (ST_Union).
+    - Convert `snap_tolerance_m` into degrees (roughly snap_tolerance_m / 111_000.0).
+    - Use ST_Snap to snap the input line to the union geometry with this tolerance.
+    - Return ST_AsText of the snapped geometry.
+
+    The SRID stays 4326 throughout.
+    """
+
+    snap_tolerance_deg = snap_tolerance_m / 111_000.0
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            WITH input_geom AS (
+                SELECT ST_SetSRID(ST_GeomFromText(%s), 4326)::geometry AS geom
+            ), envelope AS (
+                SELECT ST_Envelope(geom) AS bbox FROM input_geom
+            ), expanded_env AS (
+                SELECT ST_Transform(
+                    ST_Buffer(ST_Transform(bbox, 3857), %s),
+                    4326
+                ) AS geom
+                FROM envelope
+            ), candidates AS (
+                SELECT r.geom
+                FROM road_links_unified r
+                JOIN expanded_env e ON r.geom && e.geom
+                JOIN input_geom ig ON ST_DWithin(r.geom::geography, ig.geom::geography, %s)
+            ), union_geom AS (
+                SELECT ST_Union(geom) AS geom FROM candidates
+            )
+            SELECT
+                CASE
+                    WHEN NOT EXISTS (SELECT 1 FROM candidates) THEN ST_AsText(ig.geom)
+                    ELSE ST_AsText(ST_Snap(ig.geom, ug.geom, %s))
+                END AS snapped_wkt
+            FROM input_geom ig, union_geom ug;
+            """,
+            (wkt, search_radius_m, search_radius_m, snap_tolerance_deg),
+        )
+        row = cur.fetchone()
+        if row and row[0]:
+            return row[0]
+
+    return wkt
 
 
 # === API ===
@@ -308,6 +370,9 @@ def collector_submit(payload: CollectorRequest):
     metadata = _build_collector_metadata(payload)
 
     with get_connection() as conn:
+        snapped_wkt = snap_linestring_to_unified_roads(conn, wkt)
+        wkt_to_use = snapped_wkt or wkt
+
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
                 """
@@ -330,7 +395,7 @@ def collector_submit(payload: CollectorRequest):
                 RETURNING link_id, danger_score;
                 """,
                 (
-                    wkt,
+                    wkt_to_use,
                     "gps",
                     payload.meta.width_m,
                     payload.meta.slope_deg,
