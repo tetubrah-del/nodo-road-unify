@@ -8,7 +8,7 @@ from pathlib import Path
 import os
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from danger_score import compute_danger_score as compute_meta_danger_score
+from danger_score_utils import compute_danger_score_v2
 
 # Run: uvicorn main:app --reload
 
@@ -297,12 +297,11 @@ def collector_submit(payload: CollectorRequest):
     if not payload.points or len(payload.points) < 2:
         raise HTTPException(status_code=400, detail="At least 2 points are required")
 
-    danger_score = compute_meta_danger_score(
-        width_m=payload.meta.width_m,
-        slope_deg=payload.meta.slope_deg,
-        curvature=payload.meta.curvature,
-        visibility=payload.meta.visibility,
-        ground_condition=payload.meta.ground_condition,
+    danger_score = compute_danger_score_v2(
+        points=payload.points,
+        source="gps",
+        meta=payload.meta,
+        sensor_summary=payload.sensor_summary,
     )
 
     wkt = _build_linestring_wkt(payload.points)
