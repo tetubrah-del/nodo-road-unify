@@ -140,6 +140,24 @@ def _build_linestring_wkt(points) -> str:
     return f"LINESTRING({coords})"
 
 
+def _parse_linestring_wkt_to_points(wkt: str) -> List[CollectorPoint]:
+    """Minimal parser to turn LINESTRING WKT into CollectorPoint list."""
+
+    try:
+        inner = wkt[wkt.index("(") + 1 : wkt.rindex(")")]
+    except ValueError:
+        return []
+
+    coords: List[CollectorPoint] = []
+    for part in inner.split(","):
+        tokens = part.strip().split()
+        if len(tokens) != 2:
+            continue
+        lon, lat = map(float, tokens)
+        coords.append(CollectorPoint(lat=lat, lon=lon))
+    return coords
+
+
 def _smooth_collector_points(
     points: List[CollectorPoint],
     window_size: int = 3,
@@ -184,7 +202,9 @@ def _build_collector_metadata(
 ) -> dict:
     meta_payload = payload.meta.dict() if payload.meta else {}
     metadata = {
-        "collector": "web_pwa",
+        "collector": {
+            "name": "web_pwa",
+        },
         "num_points": len(payload.points),
         "meta": meta_payload,
         "raw_points": [p.dict() for p in payload.points],
@@ -267,64 +287,88 @@ def update_unified_gps_stats_for_track(
             (json.dumps(new_stats, ensure_ascii=False), link_id),
         )
 def snap_linestring_to_unified_roads(
-    conn: PGConnection,
-    wkt: str,
-    search_radius_m: float = 100.0,
-    snap_tolerance_m: float = 8.0,
-) -> str:
+    conn: PGConnection, raw_wkt: str, search_radius_m: float = 30.0
+) -> Optional[str]:
     """
-    Try to snap the given LINESTRING (in WKT, SRID 4326) to nearby
-    road_links_unified geometries.
+    Given a raw collector WKT (LINESTRING, SRID 4326), snap each vertex to the
+    nearest road_links_unified centerline when it is within `search_radius_m`.
 
-    - First, compute a small search envelope around the input geometry
-      (bbox expanded by `search_radius_m`).
-    - Within that envelope, collect candidate centerlines from road_links_unified.
-    - If there are no candidates, just return the original WKT.
-    - Otherwise, build a union geometry of those candidates (ST_Union).
-    - Convert `snap_tolerance_m` into degrees (roughly snap_tolerance_m / 111_000.0).
-    - Use ST_Snap to snap the input line to the union geometry with this tolerance.
-    - Return ST_AsText of the snapped geometry.
-
-    The SRID stays 4326 throughout.
+    - Vertices beyond the search radius stay unchanged.
+    - After vertex snapping, the reconstructed line is optionally snapped again
+      to a local union of unified roads with a small tolerance (≈2 m).
+    - Returns WKT of the snapped geometry, or None if snapping produced an empty
+      geometry or failed.
     """
 
-    snap_tolerance_deg = snap_tolerance_m / 111_000.0
+    snap_tolerance_deg = 2.0 / 111_000.0
 
     with conn.cursor() as cur:
-        cur.execute(
-            """
-            WITH input_geom AS (
-                SELECT ST_SetSRID(ST_GeomFromText(%s), 4326)::geometry AS geom
-            ), envelope AS (
-                SELECT ST_Envelope(geom) AS bbox FROM input_geom
-            ), expanded_env AS (
-                SELECT ST_Transform(
-                    ST_Buffer(ST_Transform(bbox, 3857), %s),
-                    4326
-                ) AS geom
-                FROM envelope
-            ), candidates AS (
-                SELECT r.geom
-                FROM road_links_unified r
-                JOIN expanded_env e ON r.geom && e.geom
-                JOIN input_geom ig ON ST_DWithin(r.geom::geography, ig.geom::geography, %s)
-            ), union_geom AS (
-                SELECT ST_Union(geom) AS geom FROM candidates
+        try:
+            cur.execute(
+                """
+                WITH input_geom AS (
+                    SELECT ST_SetSRID(ST_GeomFromText(%s), 4326)::geometry AS geom
+                ), points AS (
+                    SELECT (dp.path[1]) AS idx, dp.geom AS geom
+                    FROM input_geom, ST_DumpPoints(input_geom.geom) dp
+                ), nearest AS (
+                    SELECT
+                        p.idx,
+                        p.geom AS input_point,
+                        n.geom AS nearest_geom,
+                        ST_Distance(n.geom::geography, p.geom::geography) AS dist_m,
+                        ST_ClosestPoint(n.geom, p.geom) AS snapped_point
+                    FROM points p
+                    LEFT JOIN LATERAL (
+                        SELECT geom
+                        FROM road_links_unified
+                        ORDER BY geom <-> p.geom
+                        LIMIT 1
+                    ) n ON TRUE
+                ), adjusted AS (
+                    SELECT
+                        idx,
+                        CASE
+                            WHEN dist_m IS NOT NULL AND dist_m <= %s THEN snapped_point
+                            ELSE input_point
+                        END AS geom
+                    FROM nearest
+                ), reconstructed AS (
+                    SELECT ST_MakeLine(geom ORDER BY idx) AS geom
+                    FROM adjusted
+                ), union_geom AS (
+                    SELECT ST_Union(r.geom) AS geom
+                    FROM road_links_unified r
+                    JOIN reconstructed rc ON ST_DWithin(
+                        r.geom::geography,
+                        rc.geom::geography,
+                        %s
+                    )
+                ), snapped AS (
+                    SELECT
+                        rc.geom AS reconstructed_geom,
+                        CASE
+                            WHEN ug.geom IS NOT NULL THEN ST_LineMerge(
+                                ST_Snap(rc.geom, ug.geom, %s)
+                            )
+                            ELSE rc.geom
+                        END AS snapped_geom
+                    FROM reconstructed rc
+                    LEFT JOIN union_geom ug ON TRUE
+                )
+                SELECT ST_AsText(snapped_geom) AS snapped_wkt
+                FROM snapped
+                WHERE snapped_geom IS NOT NULL AND NOT ST_IsEmpty(snapped_geom);
+                """,
+                (raw_wkt, search_radius_m, search_radius_m, snap_tolerance_deg),
             )
-            SELECT
-                CASE
-                    WHEN NOT EXISTS (SELECT 1 FROM candidates) THEN ST_AsText(ig.geom)
-                    ELSE ST_AsText(ST_Snap(ig.geom, ug.geom, %s))
-                END AS snapped_wkt
-            FROM input_geom ig, union_geom ug;
-            """,
-            (wkt, search_radius_m, search_radius_m, snap_tolerance_deg),
-        )
-        row = cur.fetchone()
-        if row and row[0]:
-            return row[0]
+            row = cur.fetchone()
+            if row and row[0]:
+                return row[0]
+        except Exception:
+            return None
 
-    return wkt
+    return None
 
 
 # === API ===
@@ -365,6 +409,7 @@ def _build_raw_feature(row: dict) -> dict:
             "source": row.get("source"),
             "gpt_class": row.get("gpt_class"),
             "metadata_source": row.get("metadata_source"),
+            "metadata": row.get("metadata"),
         },
     }
 
@@ -406,6 +451,7 @@ def list_roads(
                     confidence,
                     (metadata->'gpt_filter'->>'class') AS gpt_class,
                     metadata->>'source' AS metadata_source,
+                    metadata,
                     ST_AsGeoJSON(geom)::json AS geom,
                     width_m,
                     slope_deg,
@@ -474,20 +520,41 @@ def collector_submit(payload: CollectorRequest):
 
     smoothed_points = _smooth_collector_points(payload.points)
 
-    danger_score = compute_danger_score_v2(
-        points=smoothed_points,
-        source="gps",
-        meta=payload.meta,
-        sensor_summary=payload.sensor_summary,
-    )
-
-    wkt = _build_linestring_wkt(smoothed_points)
-    wkt_to_use = wkt
+    raw_wkt = _build_linestring_wkt(smoothed_points)
     metadata = _build_collector_metadata(payload, smoothed_points=smoothed_points)
 
     with get_connection() as conn:
-        snapped_wkt = snap_linestring_to_unified_roads(conn, wkt)
-        wkt_to_use = snapped_wkt or wkt
+        snapped_wkt = snap_linestring_to_unified_roads(conn, raw_wkt)
+        wkt_to_use = snapped_wkt or raw_wkt
+
+        collector_meta = metadata.get("collector")
+        if isinstance(collector_meta, dict):
+            collector_meta["raw_wkt"] = raw_wkt
+            collector_meta["snapped_wkt"] = snapped_wkt
+            collector_meta["snapping_used"] = bool(snapped_wkt)
+            if snapped_wkt:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        SELECT ST_Distance(
+                            ST_GeomFromText(%s, 4326)::geography,
+                            ST_GeomFromText(%s, 4326)::geography
+                        ) AS dist_m
+                        """,
+                        (raw_wkt, snapped_wkt),
+                    )
+                    dist_row = cur.fetchone()
+                    if dist_row and dist_row[0] is not None:
+                        collector_meta["snapping_distance_m"] = float(dist_row[0])
+
+        points_for_score = _parse_linestring_wkt_to_points(wkt_to_use) or smoothed_points
+
+        danger_score = compute_danger_score_v2(
+            points=points_for_score,
+            source="gps",
+            meta=payload.meta,
+            sensor_summary=payload.sensor_summary,
+        )
 
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -793,14 +860,26 @@ def map_page():
     }
 
     function bindRawPopup(layer, p) {
+      const meta = p.metadata || {};
+      const collectorMeta = meta.collector && typeof meta.collector === 'object'
+        ? meta.collector
+        : {};
+
+      const snappingUsed = collectorMeta.snapping_used === true;
+      const snappingDistance = typeof collectorMeta.snapping_distance_m === 'number'
+        ? collectorMeta.snapping_distance_m.toFixed(2)
+        : null;
+
       const html = [
         `<b>Raw link ${p.link_id}</b>`,
         `Source: ${p.source || '-'}`,
         `GPT class: ${p.gpt_class || '-'}`,
         `Meta source: ${p.metadata_source || '-'}`,
         `Width: ${formatNumber(p.width_m, ' m')}`,
-        `Danger score: ${p.danger_score ?? '-'}`
-      ].join('<br>');
+        `Danger score: ${p.danger_score ?? '-'}`,
+        `Snapping: ${snappingUsed ? 'snapped to unified roads' : 'raw geometry'}`,
+        snappingDistance ? `Min distance before snap: ${snappingDistance} m` : null,
+      ].filter(Boolean).join('<br>');
       layer.bindPopup(html);
     }
 
