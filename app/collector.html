@@ -40,6 +40,24 @@
     <div id="error" style="color:#b00020; font-size:13px;"></div>
     <div id="collector-last-result" style="margin-top: 8px; font-size: 0.9rem;"></div>
     <div style="font-size:12px; color:#777;">ブラウザの位置情報を許可してから記録してください。</div>
+    <hr />
+    <h3 style="font-size: 1rem; margin-top: 8px;">直近の記録一覧（デバッグ用）</h3>
+    <button id="refresh-recent-runs" type="button">一覧を更新</button>
+    <div id="recent-runs-status" style="margin-top: 4px; font-size: 0.8rem;"></div>
+    <table id="recent-runs-table" style="width: 100%; font-size: 0.8rem; margin-top: 4px; border-collapse: collapse;">
+      <thead>
+        <tr>
+          <th style="border-bottom: 1px solid #ccc;">link_id</th>
+          <th style="border-bottom: 1px solid #ccc;">危険度</th>
+          <th style="border-bottom: 1px solid #ccc;">距離[m]</th>
+          <th style="border-bottom: 1px solid #ccc;">スナップ</th>
+          <th style="border-bottom: 1px solid #ccc;">距離差[m]</th>
+          <th style="border-bottom: 1px solid #ccc;">モード</th>
+          <th style="border-bottom: 1px solid #ccc;">点数</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <script>
@@ -62,6 +80,9 @@
     const sensorStatusEl = document.getElementById("sensor-status");
     const sensorModeLabelEl = document.getElementById("sensor-mode-label");
     const lastResultEl = document.getElementById("collector-last-result");
+    const recentRunsBtn = document.getElementById("refresh-recent-runs");
+    const recentRunsStatusEl = document.getElementById("recent-runs-status");
+    const recentRunsTableBody = document.querySelector("#recent-runs-table tbody");
 
     function createSensorTracker() {
       let enabled = false;
@@ -230,6 +251,65 @@
       }
     }
 
+    function renderRecentRuns(rows) {
+      recentRunsTableBody.innerHTML = '';
+      rows.forEach((run) => {
+        const tr = document.createElement('tr');
+
+        const dangerText = typeof run.danger_score === 'number'
+          ? run.danger_score.toFixed(1)
+          : '-';
+        const lengthText = typeof run.length_m === 'number'
+          ? Math.round(run.length_m).toString()
+          : '-';
+        const snappingUsedText = run.snapping_used ? 'あり' : 'なし';
+        const snappingDistText = typeof run.snapping_distance_m === 'number'
+          ? run.snapping_distance_m.toFixed(1)
+          : '–';
+        const modeText = run.mode === 'vehicle' ? '車両センサーON' : 'GPSのみ';
+        const pointsText = typeof run.num_points === 'number' ? run.num_points.toString() : '–';
+
+        [
+          run.link_id,
+          dangerText,
+          lengthText,
+          snappingUsedText,
+          snappingDistText,
+          modeText,
+          pointsText,
+        ].forEach((val) => {
+          const td = document.createElement('td');
+          td.textContent = val ?? '-';
+          td.style.borderBottom = '1px solid #eee';
+          td.style.padding = '2px 4px';
+          tr.appendChild(td);
+        });
+
+        recentRunsTableBody.appendChild(tr);
+      });
+    }
+
+    async function loadRecentRuns(limit = 20) {
+      recentRunsStatusEl.textContent = '読み込み中…';
+      try {
+        const res = await fetch(`/api/collector/recent?limit=${limit}`);
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error('failed to load');
+        }
+        const runs = Array.isArray(data.runs) ? data.runs : [];
+        renderRecentRuns(runs);
+        recentRunsStatusEl.textContent = `直近 ${runs.length} 件を表示中`;
+      } catch (e) {
+        console.error(e);
+        recentRunsStatusEl.textContent = '一覧の取得に失敗しました。';
+      }
+    }
+
+    recentRunsBtn.addEventListener('click', () => {
+      loadRecentRuns();
+    });
+
     async function toggleSensors(checked) {
       if (checked) {
         const ok = await sensorTracker.enable();
@@ -355,6 +435,7 @@
         const modeText = sensorToggle.checked ? '車両センサーON' : 'GPSのみ';
         const dangerText = typeof data.danger_score === 'number' ? data.danger_score.toFixed(1) : '-';
         setLastResult(`直近の記録: link_id=${data.link_id}, 危険度=${dangerText}, 距離=${distance}m, スナップ=${snappedText}, モード=${modeText}`);
+        loadRecentRuns();
         alert('送信しました');
         resetRecording();
       } catch (e) {
@@ -367,6 +448,7 @@
       startBtn.disabled = false;
       stopSendBtn.disabled = true;
       sensorTracker.stopSession();
+      loadRecentRuns();
     };
   </script>
 

@@ -626,6 +626,72 @@ def collector_submit(payload: CollectorRequest):
     }
 
 
+@app.get("/api/collector/recent")
+def collector_recent(limit: int = 20):
+    clamped_limit = max(1, min(limit, 100))
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT
+                    link_id,
+                    danger_score,
+                    CASE
+                        WHEN metadata->'collector'->>'snapped_wkt' IS NOT NULL THEN
+                            ST_Length(
+                                ST_GeomFromText(metadata->'collector'->>'snapped_wkt', 4326)::geography
+                            )
+                        ELSE ST_Length(geom::geography)
+                    END AS length_m,
+                    metadata
+                FROM road_links
+                WHERE source = 'gps'
+                  AND (
+                    metadata->>'collector' = 'web_pwa'
+                    OR metadata->'collector'->>'name' = 'web_pwa'
+                  )
+                ORDER BY link_id DESC
+                LIMIT %s
+                """,
+                (clamped_limit,),
+            )
+            rows = cur.fetchall()
+
+    runs = []
+    for row in rows:
+        metadata = row.get("metadata") or {}
+        collector_meta = metadata.get("collector") or {}
+        sensor_summary = metadata.get("sensor_summary") or {}
+
+        snapping_used = collector_meta.get("snapping_used") is True
+        snapping_distance = collector_meta.get("snapping_distance_m")
+        snapping_distance_m = (
+            float(snapping_distance)
+            if isinstance(snapping_distance, (int, float))
+            else None
+        )
+
+        raw_points = metadata.get("raw_points")
+        num_points = len(raw_points) if isinstance(raw_points, list) else None
+
+        runs.append(
+            {
+                "link_id": row.get("link_id"),
+                "danger_score": row.get("danger_score"),
+                "length_m": row.get("length_m"),
+                "snapping_used": snapping_used,
+                "snapping_distance_m": snapping_distance_m,
+                "mode": "vehicle"
+                if sensor_summary.get("mode") == "vehicle"
+                else "gps_only",
+                "num_points": num_points,
+            }
+        )
+
+    return {"runs": runs}
+
+
 @app.post("/api/gps_tracks")
 def create_gps_track(track: GpsTrackInput):
     if len(track.points) < 2:
