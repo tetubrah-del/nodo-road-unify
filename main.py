@@ -622,6 +622,7 @@ def collector_submit(payload: CollectorRequest):
         "status": "ok",
         "link_id": row["link_id"],
         "danger_score": row["danger_score"],
+        "snapping_used": bool(metadata.get("collector", {}).get("snapping_used")),
     }
 
 
