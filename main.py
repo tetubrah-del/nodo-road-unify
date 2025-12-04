@@ -104,6 +104,48 @@ class CollectorRequest(BaseModel):
     sensor_summary: Optional[CollectorSensorSummary] = None
 
 
+def smooth_collector_points(
+    points: List[CollectorPoint],
+    window_size: int = 3,
+) -> List[CollectorPoint]:
+    """
+    Apply a simple moving-average smoothing over lat/lon for CollectorPoint
+    sequences.
+
+    Rules:
+    - If len(points) < 3, just return the original list.
+    - Use a symmetric window around each point (default size=3).
+      For v1, we can effectively use a 3-point window: [i-1, i, i+1].
+    - Keep the first and last point unchanged (no smoothing on endpoints).
+    - For each interior point i (1 <= i <= n-2):
+        new_lat = average(lat of points[i-1], points[i], points[i+1])
+        new_lon = average(lon of points[i-1], points[i], points[i+1])
+      The timestamp_ms of the smoothed point should be the original points[i].timestamp_ms.
+    - Return a NEW list of CollectorPoint instances (do not mutate the original list).
+    """
+
+    if len(points) < 3:
+        return list(points)
+
+    smoothed: List[CollectorPoint] = []
+
+    for i, point in enumerate(points):
+        if i == 0 or i == len(points) - 1:
+            smoothed.append(CollectorPoint(**point.dict()))
+            continue
+
+        prev_p = points[i - 1]
+        next_p = points[i + 1]
+        new_lat = (prev_p.lat + point.lat + next_p.lat) / 3
+        new_lon = (prev_p.lon + point.lon + next_p.lon) / 3
+
+        smoothed.append(
+            CollectorPoint(lat=new_lat, lon=new_lon, timestamp_ms=point.timestamp_ms)
+        )
+
+    return smoothed
+
+
 def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
     """Rudimentary planar distance using lat/lon in meters."""
     lat_factor = 111_000
@@ -297,14 +339,16 @@ def collector_submit(payload: CollectorRequest):
     if not payload.points or len(payload.points) < 2:
         raise HTTPException(status_code=400, detail="At least 2 points are required")
 
+    smoothed_points = smooth_collector_points(payload.points)
+
     danger_score = compute_danger_score_v2(
-        points=payload.points,
+        points=smoothed_points,
         source="gps",
         meta=payload.meta,
         sensor_summary=payload.sensor_summary,
     )
 
-    wkt = _build_linestring_wkt(payload.points)
+    wkt = _build_linestring_wkt(smoothed_points)
     metadata = _build_collector_metadata(payload)
 
     with get_connection() as conn:
