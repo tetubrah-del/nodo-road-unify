@@ -393,6 +393,16 @@ RAW_FILTER_SQL = """
 
 
 def _build_raw_feature(row: dict) -> dict:
+    metadata = row.get("metadata")
+    collector_meta = metadata.get("collector") if isinstance(metadata, dict) else {}
+    snap_info = None
+    if isinstance(collector_meta, dict):
+        snap_info = {
+            "used": collector_meta.get("snapping_used"),
+            "distance_m": collector_meta.get("snapping_distance_m"),
+            "raw_geom": row.get("raw_geom"),
+        }
+
     return {
         "type": "Feature",
         "geometry": row["geom"],
@@ -410,6 +420,7 @@ def _build_raw_feature(row: dict) -> dict:
             "gpt_class": row.get("gpt_class"),
             "metadata_source": row.get("metadata_source"),
             "metadata": row.get("metadata"),
+            "snap": snap_info,
         },
     }
 
@@ -453,6 +464,11 @@ def list_roads(
                     metadata->>'source' AS metadata_source,
                     metadata,
                     ST_AsGeoJSON(geom)::json AS geom,
+                    CASE
+                        WHEN metadata->'collector'->>'raw_wkt' IS NOT NULL THEN
+                            ST_AsGeoJSON(ST_GeomFromText(metadata->'collector'->>'raw_wkt', 4326))::json
+                        ELSE NULL
+                    END AS raw_geom,
                     width_m,
                     slope_deg,
                     curvature,
@@ -703,7 +719,12 @@ def list_roads_geojson():
                     ground_condition,
                     danger_score,
                     metadata->>'source' AS metadata_source,
-                    ST_AsGeoJSON(geom)::json AS geom
+                    ST_AsGeoJSON(geom)::json AS geom,
+                    CASE
+                        WHEN metadata->'collector'->>'raw_wkt' IS NOT NULL THEN
+                            ST_AsGeoJSON(ST_GeomFromText(metadata->'collector'->>'raw_wkt', 4326))::json
+                        ELSE NULL
+                    END AS raw_geom
                 FROM road_links
                 ORDER BY link_id
                 """
@@ -751,6 +772,7 @@ def map_page():
 
     let rawLayer = null;
     let unifiedLayer = null;
+    let gpsRawLayer = L.layerGroup();
     let layerControl = null;
     let dangerMode = false;
 
@@ -787,6 +809,10 @@ def map_page():
         return { color: '#888888', weight: 2 };
       }
       return { color: '#aaaaaa', weight: 2 };
+    }
+
+    function gpsRawStyle() {
+      return { color: '#888888', weight: 3, dashArray: '4,4' };
     }
 
     function dangerColor(score) {
@@ -865,10 +891,14 @@ def map_page():
         ? meta.collector
         : {};
 
-      const snappingUsed = collectorMeta.snapping_used === true;
-      const snappingDistance = typeof collectorMeta.snapping_distance_m === 'number'
-        ? collectorMeta.snapping_distance_m.toFixed(2)
+      const snapInfo = p.snap || collectorMeta || {};
+      const snappingUsed = snapInfo.used === true;
+      const snappingDistance = typeof snapInfo.distance_m === 'number'
+        ? snapInfo.distance_m.toFixed(2)
         : null;
+      const snappingText = snappingUsed
+        ? `Snapped: yes${snappingDistance ? ` (${snappingDistance} m)` : ''}`
+        : 'Snapped: no';
 
       const html = [
         `<b>Raw link ${p.link_id}</b>`,
@@ -877,10 +907,20 @@ def map_page():
         `Meta source: ${p.metadata_source || '-'}`,
         `Width: ${formatNumber(p.width_m, ' m')}`,
         `Danger score: ${p.danger_score ?? '-'}`,
-        `Snapping: ${snappingUsed ? 'snapped to unified roads' : 'raw geometry'}`,
-        snappingDistance ? `Min distance before snap: ${snappingDistance} m` : null,
+        snappingText,
       ].filter(Boolean).join('<br>');
       layer.bindPopup(html);
+    }
+
+    function addRawGpsDebug(feature) {
+      const p = feature.properties || {};
+      if (p.source !== 'gps') return;
+
+      const snapMeta = p.snap || (p.metadata && p.metadata.collector) || null;
+      if (!snapMeta || !snapMeta.raw_geom) return;
+
+      const rawFeature = { type: 'Feature', geometry: snapMeta.raw_geom };
+      L.geoJSON(rawFeature, { style: gpsRawStyle }).addTo(gpsRawLayer);
     }
 
     async function loadLayers() {
@@ -901,6 +941,8 @@ def map_page():
       const rawGeojson = await rawRes.json();
       const unifiedGeojson = await unifiedRes.json();
 
+      gpsRawLayer.clearLayers();
+
       if (rawLayer) rawLayer.remove();
       if (unifiedLayer) unifiedLayer.remove();
       if (layerControl) {
@@ -915,12 +957,16 @@ def map_page():
 
       rawLayer = L.geoJSON(rawGeojson, {
         style: rawStyle,
-        onEachFeature: (feature, layer) => bindRawPopup(layer, feature.properties),
+        onEachFeature: (feature, layer) => {
+          bindRawPopup(layer, feature.properties);
+          addRawGpsDebug(feature);
+        },
       }).addTo(map);
 
       const overlayMaps = {
         'Raw（カラー分け）': rawLayer,
         'Unified（統合レイヤー・黒）': unifiedLayer,
+        '生GPS軌跡（デバッグ）': gpsRawLayer,
       };
       layerControl = L.control.layers(null, overlayMaps).addTo(map);
 
