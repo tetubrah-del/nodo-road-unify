@@ -30,7 +30,9 @@ def _vector_m(p_from: CollectorPoint, p_to: CollectorPoint) -> tuple[float, floa
 def _compute_track_angles(points: List[CollectorPoint]) -> List[float]:
     angles: List[float] = []
     for i in range(1, len(points) - 1):
-        v1 = _vector_m(points[i], points[i - 1])
+        # Use (prev -> current) and (current -> next) vectors so a straight line yields ~0°
+        # instead of ~180° when the directions are reversed.
+        v1 = _vector_m(points[i - 1], points[i])
         v2 = _vector_m(points[i], points[i + 1])
         dot = v1[0] * v2[0] + v1[1] * v2[1]
         norm1 = math.hypot(*v1)
@@ -91,18 +93,26 @@ def compute_danger_score_v2(
     sensor_rms = 0.0
     sensor_max = 0.0
     sensor_pitch = 0.0
+    worst_rms = False
+    worst_max = False
+    worst_pitch = False
     if sensor_summary is not None and sensor_summary.mode == "vehicle":
-        vertical_rms = sensor_summary.vertical_rms or 0.0
+        raw_vertical_rms = sensor_summary.vertical_rms
+        vertical_rms = raw_vertical_rms or 0.0
+        worst_rms = raw_vertical_rms is not None and raw_vertical_rms >= 1.2
         if 1.2 <= vertical_rms:
             sensor_rms = 0.6
         elif 0.8 <= vertical_rms < 1.2:
             sensor_rms = 0.3
 
         vertical_max = sensor_summary.vertical_max
+        worst_max = vertical_max is not None and vertical_max >= 2.5
         if vertical_max is not None and vertical_max >= 2.5:
             sensor_max = 0.4
 
-        abs_pitch = abs(sensor_summary.pitch_mean_deg or 0.0)
+        raw_pitch = sensor_summary.pitch_mean_deg
+        abs_pitch = abs(raw_pitch or 0.0)
+        worst_pitch = raw_pitch is not None and abs(raw_pitch) >= 6.0
         if 6.0 <= abs_pitch:
             sensor_pitch = 0.6
         elif 3.0 <= abs_pitch < 6.0:
@@ -119,6 +129,11 @@ def compute_danger_score_v2(
         + sensor_max
         + sensor_pitch
     )
+
+    if sensor_summary is not None and sensor_summary.mode == "vehicle":
+        if worst_rms and worst_max and worst_pitch:
+            # ensure we actually hit the upper cap for very rough vehicle segments
+            score = max(score, 5.0)
 
     score = max(1.0, min(5.0, score))
     return round(score, 2)
