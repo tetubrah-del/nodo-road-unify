@@ -383,6 +383,7 @@ def _build_unified_feature(row: dict) -> dict:
             "visibility": row.get("visibility"),
             "ground_condition": row.get("ground_condition"),
             "danger_score": row.get("danger_score"),
+            "metadata": row.get("metadata"),
         },
     }
 
@@ -449,6 +450,7 @@ def list_unified_roads(
                     visibility,
                     ground_condition,
                     danger_score,
+                    metadata,
                     ST_AsGeoJSON(geom)::json AS geom
                 FROM road_links_unified
                 WHERE geom && ST_MakeEnvelope(%s, %s, %s, %s, 4326)
@@ -733,14 +735,27 @@ def map_page():
 
     function unifiedStyle(feature) {
       const p = feature.properties || {};
+      const meta = p.metadata || {};
+      const gpsStats = meta.gps_stats || {};
+
+      const avgDanger = typeof gpsStats.avg_danger === 'number'
+        ? gpsStats.avg_danger
+        : p.danger_score;
+
+      const score = typeof avgDanger === 'number' ? avgDanger : 1.0;
+
       if (!dangerMode) {
         return { color: '#000000', weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' };
       }
-      const color = dangerColor(p.danger_score);
+
+      const color = dangerColor(score);
       return { color, weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' };
     }
 
     function bindUnifiedPopup(layer, p) {
+      const meta = p.metadata || {};
+      const gpsStats = meta.gps_stats || {};
+
       const html = [
         `<b>Unified link ${p.link_id}</b>`,
         `Sources: ${formatList(p.sources)}`,
@@ -752,7 +767,29 @@ def map_page():
         `Ground: ${groundLabel(p.ground_condition)}`,
         `Danger score: ${p.danger_score ?? '-'}`
       ].join('<br>');
-      layer.bindPopup(html);
+
+      let gpsHtml = '';
+      const hasGpsStats = gpsStats && (
+        typeof gpsStats.count === 'number'
+        || typeof gpsStats.avg_danger === 'number'
+        || typeof gpsStats.last_danger === 'number'
+      );
+
+      if (hasGpsStats) {
+        gpsHtml += '<hr>';
+        gpsHtml += '<b>GPS stats</b><br>';
+        if (typeof gpsStats.count === 'number') {
+          gpsHtml += `Runs: ${gpsStats.count}<br>`;
+        }
+        if (typeof gpsStats.avg_danger === 'number') {
+          gpsHtml += `Avg danger: ${gpsStats.avg_danger.toFixed(2)}<br>`;
+        }
+        if (typeof gpsStats.last_danger === 'number') {
+          gpsHtml += `Last danger: ${gpsStats.last_danger.toFixed(2)}<br>`;
+        }
+      }
+
+      layer.bindPopup(html + gpsHtml);
     }
 
     function bindRawPopup(layer, p) {
