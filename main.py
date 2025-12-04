@@ -140,7 +140,48 @@ def _build_linestring_wkt(points) -> str:
     return f"LINESTRING({coords})"
 
 
-def _build_collector_metadata(payload: CollectorRequest) -> dict:
+def _smooth_collector_points(
+    points: List[CollectorPoint],
+    window_size: int = 3,
+) -> List[CollectorPoint]:
+    """
+    Apply a simple moving-average smoothing to a sequence of CollectorPoint
+    objects. We keep the same number of points and preserve timestamps.
+
+    - window_size: odd integer >= 3 (default 3)
+    - for each index i, average lat/lon over points in [i-half, i+half]
+      clipped to the valid range.
+    - timestamps are copied from the original point at i.
+    - if len(points) < 3 or window_size < 3, just return the original list.
+    """
+
+    if len(points) < 3 or window_size < 3:
+        return points
+
+    half = window_size // 2
+    smoothed: List[CollectorPoint] = []
+
+    for i in range(len(points)):
+        start = max(0, i - half)
+        end = min(len(points) - 1, i + half)
+        window = points[start : end + 1]
+        avg_lat = sum(p.lat for p in window) / len(window)
+        avg_lon = sum(p.lon for p in window) / len(window)
+
+        smoothed.append(
+            CollectorPoint(
+                lat=avg_lat,
+                lon=avg_lon,
+                timestamp_ms=points[i].timestamp_ms,
+            )
+        )
+
+    return smoothed
+
+
+def _build_collector_metadata(
+    payload: CollectorRequest, smoothed_points: Optional[List[CollectorPoint]] = None
+) -> dict:
     meta_payload = payload.meta.dict() if payload.meta else {}
     metadata = {
         "collector": "web_pwa",
@@ -148,6 +189,9 @@ def _build_collector_metadata(payload: CollectorRequest) -> dict:
         "meta": meta_payload,
         "raw_points": [p.dict() for p in payload.points],
     }
+
+    if smoothed_points is not None:
+        metadata["smoothed_points"] = [p.dict() for p in smoothed_points]
 
     if payload.sensor_summary is not None:
         metadata["sensor_summary"] = payload.sensor_summary.dict()
@@ -426,23 +470,20 @@ def collector_submit(payload: CollectorRequest):
     if not payload.points or len(payload.points) < 2:
         raise HTTPException(status_code=400, detail="At least 2 points are required")
 
+    smoothed_points = _smooth_collector_points(payload.points)
+
     danger_score = compute_danger_score_v2(
-        points=payload.points,
+        points=smoothed_points,
         source="gps",
         meta=payload.meta,
         sensor_summary=payload.sensor_summary,
     )
 
-    wkt = _build_linestring_wkt(payload.points)
+    wkt = _build_linestring_wkt(smoothed_points)
     wkt_to_use = wkt
-    metadata = _build_collector_metadata(payload)
+    metadata = _build_collector_metadata(payload, smoothed_points=smoothed_points)
 
     with get_connection() as conn:
-        update_unified_gps_stats_for_track(
-            conn=conn,
-            geom_wkt=wkt_to_use,
-            danger_score=danger_score,
-        )
         snapped_wkt = snap_linestring_to_unified_roads(conn, wkt)
         wkt_to_use = snapped_wkt or wkt
 
@@ -480,6 +521,12 @@ def collector_submit(payload: CollectorRequest):
                 ),
             )
             row = cur.fetchone()
+
+        update_unified_gps_stats_for_track(
+            conn=conn,
+            geom_wkt=wkt_to_use,
+            danger_score=danger_score,
+        )
 
     print(
         f"[collector] points={len(payload.points)} danger_score={danger_score} "
