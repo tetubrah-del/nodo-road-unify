@@ -155,6 +155,73 @@ def _build_collector_metadata(payload: CollectorRequest) -> dict:
     return metadata
 
 
+def update_unified_gps_stats_for_track(
+    conn: PGConnection,
+    geom_wkt: str,
+    danger_score: float,
+    search_radius_m: float = 30.0,
+) -> None:
+    """
+    For the given GPS track geometry (WKT, SRID 4326) and its danger_score,
+    find the nearest road_links_unified row within search_radius_m meters
+    and update its metadata->gps_stats (count, avg_danger, last_danger).
+    """
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            WITH track AS (
+                SELECT ST_GeomFromText(%s, 4326) AS geom
+            )
+            SELECT
+                u.link_id,
+                u.metadata,
+                ST_Distance(u.geom::geography, track.geom::geography) AS dist
+            FROM road_links_unified u, track
+            WHERE ST_DWithin(u.geom::geography, track.geom::geography, %s)
+            ORDER BY dist
+            LIMIT 1
+            """,
+            (geom_wkt, search_radius_m),
+        )
+        row = cur.fetchone()
+
+    if not row:
+        return
+
+    link_id = row["link_id"]
+    metadata = row.get("metadata") or {}
+    gps_stats = metadata.get("gps_stats") or {}
+
+    old_count = gps_stats.get("count") or 0
+    old_avg = gps_stats.get("avg_danger")
+
+    new_count = old_count + 1
+    if old_count == 0 or old_avg is None:
+        new_avg = danger_score
+    else:
+        new_avg = (old_avg * old_count + danger_score) / new_count
+
+    new_stats = {
+        "count": new_count,
+        "avg_danger": new_avg,
+        "last_danger": danger_score,
+    }
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            UPDATE road_links_unified
+            SET metadata = jsonb_set(
+                COALESCE(metadata, '{}'::jsonb),
+                '{gps_stats}',
+                %s::jsonb,
+                true
+            )
+            WHERE link_id = %s
+            """,
+            (json.dumps(new_stats, ensure_ascii=False), link_id),
+        )
 def snap_linestring_to_unified_roads(
     conn: PGConnection,
     wkt: str,
@@ -367,9 +434,15 @@ def collector_submit(payload: CollectorRequest):
     )
 
     wkt = _build_linestring_wkt(payload.points)
+    wkt_to_use = wkt
     metadata = _build_collector_metadata(payload)
 
     with get_connection() as conn:
+        update_unified_gps_stats_for_track(
+            conn=conn,
+            geom_wkt=wkt_to_use,
+            danger_score=danger_score,
+        )
         snapped_wkt = snap_linestring_to_unified_roads(conn, wkt)
         wkt_to_use = snapped_wkt or wkt
 
