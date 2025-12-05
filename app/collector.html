@@ -126,10 +126,80 @@
     const sensorToggle = document.getElementById("sensorToggle");
     const sensorStatusEl = document.getElementById("sensor-status");
     const sensorModeLabelEl = document.getElementById("sensor-mode-label");
+    const wakeLockStatusEl = document.createElement('div');
+    wakeLockStatusEl.id = 'wake-lock-status';
+    wakeLockStatusEl.style.fontSize = '13px';
+    wakeLockStatusEl.style.color = '#555';
+    sensorStatusEl.insertAdjacentElement('afterend', wakeLockStatusEl);
     const lastResultEl = document.getElementById("collector-last-result");
     const recentRunsBtn = document.getElementById("refresh-recent-runs");
     const recentRunsStatusEl = document.getElementById("recent-runs-status");
     const recentRunsTableBody = document.querySelector("#recent-runs-table tbody");
+
+    let wakeLock = null;
+    let isRecording = false;
+
+    const wakeLockSupported = typeof navigator !== 'undefined' && 'wakeLock' in navigator;
+
+    const setWakeLockLabel = (state) => {
+      if (!wakeLockStatusEl) return;
+      if (!wakeLockSupported) {
+        wakeLockStatusEl.textContent = '画面スリープ防止: 未対応';
+        return;
+      }
+      const label = state === 'active' ? '画面スリープ防止: 有効' : '画面スリープ防止: 無効';
+      wakeLockStatusEl.textContent = label;
+    };
+
+    setWakeLockLabel('inactive');
+
+    async function enableWakeLock() {
+      if (!wakeLockSupported) {
+        console.info('Wake Lock API not supported');
+        setWakeLockLabel('inactive');
+        return;
+      }
+      if (wakeLock) return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => {
+          console.log('Screen Wake Lock was released');
+          setWakeLockLabel('inactive');
+        });
+        console.log('Screen Wake Lock is active');
+        setWakeLockLabel('active');
+      } catch (err) {
+        console.warn('Failed to acquire Wake Lock', err);
+        wakeLock = null;
+        setWakeLockLabel('inactive');
+      }
+    }
+
+    async function disableWakeLock() {
+      if (!wakeLock) {
+        setWakeLockLabel('inactive');
+        return;
+      }
+      try {
+        await wakeLock.release();
+      } catch (err) {
+        console.warn('Failed to release Wake Lock', err);
+      }
+      wakeLock = null;
+      setWakeLockLabel('inactive');
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && isRecording) {
+        enableWakeLock();
+      } else if (document.visibilityState === 'hidden') {
+        disableWakeLock();
+      }
+    });
+
+    window.addEventListener('pagehide', () => {
+      disableWakeLock();
+    });
 
     function createSensorTracker() {
       let enabled = false;
@@ -401,12 +471,13 @@
       return Math.round(total);
     }
 
-    startBtn.onclick = () => {
+    startBtn.onclick = async () => {
       resetRecording();
       statusEl.textContent = "GPS記録中...";
       startBtn.disabled = true;
       stopSendBtn.disabled = false;
       sensorTracker.startSession();
+      isRecording = true;
 
       if (!navigator.geolocation) {
         alert("この端末はGPSが使えません");
@@ -414,33 +485,45 @@
         startBtn.disabled = false;
         stopSendBtn.disabled = true;
         sensorTracker.stopSession();
+        isRecording = false;
+        await disableWakeLock();
         return;
       }
 
-      watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          const lat = pos.coords.latitude;
-          const lon = pos.coords.longitude;
-          const point = { lat, lon, timestamp_ms: Date.now() };
-          recordedPoints.push(point);
-          updatePointsCount();
+      try {
+        watchId = navigator.geolocation.watchPosition(
+          (pos) => {
+            const lat = pos.coords.latitude;
+            const lon = pos.coords.longitude;
+            const point = { lat, lon, timestamp_ms: Date.now() };
+            recordedPoints.push(point);
+            updatePointsCount();
 
-          if (!polyline) {
-            polyline = L.polyline([[lat, lon]], { color: "blue" }).addTo(map);
-          } else {
-            polyline.addLatLng([lat, lon]);
+            if (!polyline) {
+              polyline = L.polyline([[lat, lon]], { color: "blue" }).addTo(map);
+            } else {
+              polyline.addLatLng([lat, lon]);
+            }
+          },
+          (err) => {
+            console.error(err);
+            alert("位置情報が取得できません: " + err.message);
+            isRecording = false;
+            disableWakeLock();
+          },
+          {
+            enableHighAccuracy: true,
+            maximumAge: 0,
+            timeout: 10000,
           }
-        },
-        (err) => {
-          console.error(err);
-          alert("位置情報が取得できません: " + err.message);
-        },
-        {
-          enableHighAccuracy: true,
-          maximumAge: 0,
-          timeout: 10000,
-        }
-      );
+        );
+        await enableWakeLock();
+      } catch (err) {
+        console.error('Failed to start geolocation watch', err);
+        alert('位置情報の取得を開始できませんでした');
+        isRecording = false;
+        await disableWakeLock();
+      }
     };
 
     stopSendBtn.onclick = async () => {
@@ -450,6 +533,8 @@
       }
 
       sensorTracker.stopSession();
+      isRecording = false;
+      await disableWakeLock();
 
       if (recordedPoints.length < 2) {
         alert("2ポイント以上記録してから送信してください");
