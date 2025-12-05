@@ -1,7 +1,7 @@
 import json
 import logging
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from statistics import mean, median, pstdev
 from typing import Iterable, List, Literal, Optional, Sequence, Tuple
 
@@ -40,6 +40,9 @@ class MultirunParams(BaseModel):
     quality_min: float = 0.3
     outlier_sigma: float = 2.0
     max_alignment_cost: Optional[float] = None
+    max_length_ratio_from_median: Optional[float] = None
+    min_quality_score: Optional[float] = None
+    min_coverage_ratio: Optional[float] = None
     reference_method: Literal["best_quality", "medoid"] = "best_quality"
     align_method: Literal["index", "dtw"] = "index"
 
@@ -53,6 +56,10 @@ class RunQualityStats:
     quality: Optional[float] = None
     alignment_cost: Optional[float] = None
     alignment_indices: Optional[List[int]] = None
+    length_ratio: Optional[float] = None
+    coverage_ratio: Optional[float] = None
+    is_outlier: bool = False
+    outlier_reasons: List[str] = field(default_factory=list)
 
 
 def _distance_m(p1: Point, p2: Point) -> float:
@@ -177,9 +184,11 @@ def compute_run_quality(
 
     if length_median and length_median > 0:
         ratio = stats.length_m / length_median
+        stats.length_ratio = ratio
         diff = abs(ratio - 1.0)
         length_consistency = max(0.0, 1.0 - diff / 0.5)
     else:
+        stats.length_ratio = None
         length_consistency = 0.5
 
     sensor_quality_norm = (
@@ -252,6 +261,9 @@ def compute_and_filter_runs_by_quality(
     length_median = median([s.length_m for s in stats_list if s.length_m is not None])
 
     for stats in stats_list:
+        stats.length_ratio = (
+            stats.length_m / length_median if length_median and length_median > 0 else None
+        )
         if alignment_mappings and stats.run_id in alignment_mappings:
             stats.alignment_indices = alignment_mappings.get(stats.run_id)
         if alignment_costs and stats.run_id in alignment_costs:
@@ -273,15 +285,48 @@ def compute_and_filter_runs_by_quality(
 
     for stats in stats_list:
         quality = stats.quality if stats.quality is not None else 0.0
-        is_low = quality < params.quality_min
-        is_outlier = quality < mean_q - params.outlier_sigma * std_q
-        over_alignment_cost = (
+        reasons: List[str] = []
+
+        if quality < params.quality_min:
+            reasons.append("quality_min")
+        if quality < mean_q - params.outlier_sigma * std_q:
+            reasons.append("quality_outlier")
+        if (
             params.max_alignment_cost is not None
             and stats.alignment_cost is not None
             and stats.alignment_cost > params.max_alignment_cost
-            and stats.run_id != reference_run_id
-        )
-        if is_low or is_outlier or over_alignment_cost:
+        ):
+            reasons.append("alignment_cost")
+        if (
+            params.max_length_ratio_from_median is not None
+            and stats.length_ratio is not None
+            and (
+                stats.length_ratio > params.max_length_ratio_from_median
+                or stats.length_ratio < 1.0 / params.max_length_ratio_from_median
+            )
+        ):
+            reasons.append("length_ratio")
+        if (
+            params.min_quality_score is not None
+            and stats.quality is not None
+            and stats.quality < params.min_quality_score
+        ):
+            reasons.append("quality_score")
+        if (
+            params.min_coverage_ratio is not None
+            and stats.coverage_ratio is not None
+            and stats.coverage_ratio < params.min_coverage_ratio
+        ):
+            reasons.append("coverage_ratio")
+
+        stats.outlier_reasons = reasons
+        stats.is_outlier = bool(reasons)
+
+        if stats.run_id == reference_run_id:
+            kept.append(stats)
+            continue
+
+        if reasons:
             removed.append(stats)
         else:
             kept.append(stats)
@@ -1163,7 +1208,11 @@ def unify_runs(
         width_profile=width_profile,
         hmm=hmm_summary if (use_hmm or hmm_debug) else None,
         removed_runs=[
-            {"run_id": stats.run_id, "quality": stats.quality}
+            {
+                "run_id": stats.run_id,
+                "quality": stats.quality,
+                "reasons": stats.outlier_reasons,
+            }
             for stats in removed_stats
         ],
     )

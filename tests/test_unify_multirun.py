@@ -284,3 +284,93 @@ def test_alignment_cost_used_for_filtering():
     assert bad_run.link_id in removed_ids
     aligned_stats = [s for s in kept if s.run_id != ref_run.link_id]
     assert all(s.alignment_cost is not None for s in aligned_stats)
+
+
+def test_outlier_filter_combines_multiple_metrics():
+    reference = Run(
+        link_id=1,
+        points=[{"lat": 0.0, "lon": i * 0.0001} for i in range(10)],
+    )
+    normal_run = Run(
+        link_id=2,
+        points=[{"lat": 0.00001, "lon": i * 0.0001} for i in range(10)],
+    )
+    long_run = Run(
+        link_id=3,
+        points=[{"lat": 0.00002, "lon": i * 0.0001} for i in range(20)],
+    )
+    misaligned_run = Run(
+        link_id=4,
+        points=[{"lat": 0.001, "lon": i * 0.0001} for i in range(10)],
+    )
+    low_quality_run = Run(
+        link_id=5,
+        points=[{"lat": 0.00003, "lon": i * 0.0001} for i in range(10)],
+    )
+
+    params = MultirunParams(
+        align_method="dtw",
+        use_quality_filter=True,
+        quality_min=0.0,
+        outlier_sigma=10.0,
+        max_alignment_cost=80.0,
+        max_length_ratio_from_median=1.6,
+        min_quality_score=0.3,
+    )
+
+    runs = [reference, normal_run, long_run, misaligned_run, low_quality_run]
+    stats = build_run_quality_stats(runs)
+
+    length_med = median([s.length_m for s in stats])
+    for s in stats:
+        if s.run_id == reference.link_id:
+            s.hmm_score = 0.9
+        elif s.run_id == low_quality_run.link_id:
+            s.hmm_score = 0.0
+        else:
+            s.hmm_score = 0.8
+        compute_run_quality(s, length_med, params)
+
+    ref_stats = select_reference_run(stats, params)
+    ref_run = next(r for r in runs if r.link_id == ref_stats.run_id)
+    normalized = [
+        Run(
+            link_id=r.link_id,
+            points=(
+                normalize_direction(ref_run.points, r.points)
+                if r.link_id != ref_run.link_id
+                else r.points
+            ),
+            metadata=r.metadata,
+        )
+        for r in runs
+    ]
+
+    others = [r for r in normalized if r.link_id != ref_run.link_id]
+    alignments, alignment_costs = build_alignment_mappings(ref_run, others, params)
+    alignment_costs[ref_run.link_id] = None
+
+    kept, removed = compute_and_filter_runs_by_quality(
+        stats,
+        params,
+        alignment_costs=alignment_costs,
+        alignment_mappings=alignments,
+        reference_run_id=ref_run.link_id,
+    )
+
+    kept_ids = {s.run_id for s in kept}
+    removed_ids = {s.run_id for s in removed}
+
+    assert ref_run.link_id in kept_ids
+    assert normal_run.link_id in kept_ids
+    assert long_run.link_id in removed_ids
+    assert misaligned_run.link_id in removed_ids
+    assert low_quality_run.link_id in removed_ids
+
+    long_stats = next(s for s in removed if s.run_id == long_run.link_id)
+    misaligned_stats = next(s for s in removed if s.run_id == misaligned_run.link_id)
+    low_quality_stats = next(s for s in removed if s.run_id == low_quality_run.link_id)
+
+    assert "length_ratio" in long_stats.outlier_reasons
+    assert "alignment_cost" in misaligned_stats.outlier_reasons
+    assert "quality_score" in low_quality_stats.outlier_reasons
