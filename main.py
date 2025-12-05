@@ -27,6 +27,21 @@ PG_PASS = os.getenv("PG_PASS", "nodo_password")
 app = FastAPI(title="Nodo Safety API")
 
 
+# === Utils ===
+def safe_dict(value):
+    if isinstance(value, dict):
+        return value
+
+    if isinstance(value, str):
+        try:
+            loaded = json.loads(value)
+            return loaded if isinstance(loaded, dict) else {}
+        except Exception:
+            return {}
+
+    return {}
+
+
 # === DB helpers ===
 def get_conn():
     return psycopg2.connect(
@@ -717,9 +732,15 @@ def collector_recent(limit: int = 20):
 
     runs = []
     for row in rows:
-        metadata = row.get("metadata") or {}
-        collector_meta = metadata.get("collector") or {}
-        sensor_summary = metadata.get("sensor_summary") or {}
+        # --- metadata safe dict ---
+        raw_metadata = row.get("metadata")
+        metadata = safe_dict(raw_metadata)
+
+        # --- collector ---
+        collector_meta = safe_dict(metadata.get("collector"))
+
+        # --- sensor summary ---
+        sensor_summary = safe_dict(metadata.get("sensor_summary"))
 
         snapping_used = collector_meta.get("snapping_used") is True
         snapping_distance = collector_meta.get("snapping_distance_m")
