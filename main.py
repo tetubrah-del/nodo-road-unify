@@ -1,15 +1,18 @@
 import json
 import math
+import os
+from pathlib import Path
+from typing import List, Literal, Optional
+
+import psycopg2
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from pydantic import BaseModel, Field
-from typing import Optional, List, Literal
-from pathlib import Path
-import os
-import psycopg2
 from psycopg2.extras import RealDictCursor
 from psycopg2.extensions import connection as PGConnection
+from pydantic import BaseModel, Field
+
 from danger_score_utils import compute_danger_score_v2
+from unify_multirun import unify_runs
 
 # Run: uvicorn main:app --reload
 
@@ -103,6 +106,10 @@ class CollectorRequest(BaseModel):
     points: List[CollectorPoint]
     meta: CollectorMeta = Field(default_factory=CollectorMeta)
     sensor_summary: Optional[CollectorSensorSummary] = None
+
+
+class MultiRunUnifyRequest(BaseModel):
+    link_ids: List[int]
 
 
 def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
@@ -375,6 +382,23 @@ def snap_linestring_to_unified_roads(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/unify/multirun")
+def unify_multirun(payload: MultiRunUnifyRequest):
+    if len(payload.link_ids) < 2:
+        raise HTTPException(status_code=400, detail="link_ids must contain at least two items")
+
+    try:
+        with get_connection() as conn:
+            new_link_id = unify_runs(payload.link_ids, conn=conn)
+            return {"unified_link_id": new_link_id, "status": "ok"}
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 RAW_FILTER_SQL = """

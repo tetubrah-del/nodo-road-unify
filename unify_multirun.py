@@ -1,0 +1,508 @@
+import json
+import math
+from dataclasses import dataclass
+from statistics import median
+from typing import Iterable, List, Optional, Sequence
+
+from psycopg2.extras import RealDictCursor
+from psycopg2.extensions import connection as PGConnection
+try:
+    from geographiclib.geodesic import Geodesic
+except ModuleNotFoundError:  # pragma: no cover - fallback for offline environments
+    class _FallbackGeodesic:
+        @staticmethod
+        def Inverse(lat1: float, lon1: float, lat2: float, lon2: float) -> dict:
+            lat1_rad = math.radians(lat1)
+            lat2_rad = math.radians(lat2)
+            d_lat = lat2_rad - lat1_rad
+            d_lon = math.radians(lon2 - lon1)
+            a = (
+                math.sin(d_lat / 2) ** 2
+                + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(d_lon / 2) ** 2
+            )
+            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+            return {"s12": 6378137.0 * c}
+
+    class Geodesic:  # type: ignore
+        WGS84 = _FallbackGeodesic()
+
+
+Point = dict
+
+
+@dataclass
+class Run:
+    link_id: int
+    points: List[Point]
+    metadata: Optional[dict] = None
+
+
+def geodesic_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    g = Geodesic.WGS84.Inverse(lat1, lon1, lat2, lon2)
+    return g["s12"]
+
+
+def _distance_m(p1: Point, p2: Point) -> float:
+    return geodesic_distance_m(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+
+
+def _parse_linestring_wkt(wkt: str) -> List[Point]:
+    try:
+        inner = wkt[wkt.index("(") + 1 : wkt.rindex(")")]
+    except ValueError:
+        return []
+
+    points: List[Point] = []
+    for part in inner.split(","):
+        tokens = part.strip().split()
+        if len(tokens) != 2:
+            continue
+        lon, lat = map(float, tokens)
+        points.append({"lat": lat, "lon": lon})
+
+    return points
+
+
+def _polyline_length(points: Sequence[Point]) -> float:
+    if len(points) < 2:
+        return 0.0
+
+    total = 0.0
+    for i in range(len(points) - 1):
+        total += _distance_m(points[i], points[i + 1])
+    return total
+
+
+def _cumulative_distances(points: Sequence[Point]) -> List[float]:
+    if not points:
+        return []
+
+    dists = [0.0]
+    for i in range(1, len(points)):
+        dists.append(dists[-1] + _distance_m(points[i - 1], points[i]))
+    return dists
+
+
+def _average_speed_mps(points: Sequence[Point]) -> Optional[float]:
+    if len(points) < 2:
+        return None
+
+    timestamps = [p.get("timestamp_ms") for p in points]
+    if any(ts is None for ts in timestamps):
+        return None
+
+    duration_ms = points[-1].get("timestamp_ms") - points[0].get("timestamp_ms")
+    if duration_ms is None or duration_ms <= 0:
+        return None
+
+    total_distance = _polyline_length(points)
+    return total_distance / (duration_ms / 1000.0)
+
+
+def _sensor_weight(metadata: Optional[dict]) -> float:
+    if not metadata:
+        return 1.0
+
+    summary = metadata.get("sensor_summary") if isinstance(metadata, dict) else None
+    if not isinstance(summary, dict):
+        return 1.0
+
+    mode = summary.get("mode")
+    vertical_rms = summary.get("vertical_rms")
+
+    if mode == "vehicle":
+        if isinstance(vertical_rms, (int, float)) and vertical_rms >= 1.2:
+            return 1.1
+        return 1.0
+
+    return 0.7
+
+
+def _run_weight(run: Run) -> float:
+    w_base = 1.0
+    speed = _average_speed_mps(run.points)
+    if speed is None:
+        w_speed = 1.0
+    elif speed < 1.5:
+        w_speed = 0.6
+    elif speed < 6:
+        w_speed = 1.0
+    else:
+        w_speed = 1.1
+
+    w_sensor = _sensor_weight(run.metadata)
+
+    return w_base * w_speed * w_sensor
+
+
+def normalize_direction(reference_points: Sequence[Point], candidate_points: Sequence[Point]) -> List[Point]:
+    if not reference_points or not candidate_points:
+        return list(candidate_points)
+
+    limit = min(len(reference_points), len(candidate_points))
+    forward_dists = [
+        geodesic_distance_m(
+            reference_points[i]["lat"],
+            reference_points[i]["lon"],
+            candidate_points[i]["lat"],
+            candidate_points[i]["lon"],
+        )
+        for i in range(limit)
+    ]
+    reversed_candidate = list(reversed(candidate_points))
+    reverse_dists = [
+        geodesic_distance_m(
+            reference_points[i]["lat"],
+            reference_points[i]["lon"],
+            reversed_candidate[i]["lat"],
+            reversed_candidate[i]["lon"],
+        )
+        for i in range(limit)
+    ]
+
+    forward_mean = sum(forward_dists) / limit if limit else math.inf
+    reverse_mean = sum(reverse_dists) / limit if limit else math.inf
+
+    if reverse_mean < forward_mean:
+        return reversed_candidate
+
+    return list(candidate_points)
+
+
+def _clip_to_length(points: Sequence[Point], target_length_m: float) -> List[Point]:
+    if not points:
+        return []
+
+    cumdist = _cumulative_distances(points)
+    total_length = cumdist[-1] if cumdist else 0.0
+
+    if total_length <= target_length_m:
+        return list(points)
+
+    clipped: List[Point] = [points[0]]
+    for idx in range(1, len(points)):
+        prev_d = cumdist[idx - 1]
+        curr_d = cumdist[idx]
+        prev_p = points[idx - 1]
+        curr_p = points[idx]
+
+        if curr_d < target_length_m:
+            clipped.append(curr_p)
+            continue
+
+        segment_len = curr_d - prev_d
+        if segment_len <= 0:
+            clipped.append(curr_p)
+            continue
+
+        ratio = (target_length_m - prev_d) / segment_len
+        ratio = max(0.0, min(1.0, ratio))
+        lat = prev_p["lat"] + (curr_p["lat"] - prev_p["lat"]) * ratio
+        lon = prev_p["lon"] + (curr_p["lon"] - prev_p["lon"]) * ratio
+        clipped.append({"lat": lat, "lon": lon})
+        return clipped
+
+    return list(points)
+
+
+def load_runs_from_db(conn: PGConnection, link_ids: Iterable[int]) -> List[Run]:
+    ids = list(link_ids)
+    if not ids:
+        return []
+
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute(
+            """
+            SELECT link_id, ST_AsText(geom) AS wkt, metadata
+            FROM road_links
+            WHERE link_id = ANY(%s)
+            ORDER BY link_id
+            """,
+            (ids,),
+        )
+        rows = cur.fetchall()
+
+    runs: List[Run] = []
+    for row in rows:
+        wkt = row.get("wkt")
+        link_id = row.get("link_id")
+        if wkt is None or link_id is None:
+            continue
+        metadata = row.get("metadata")
+        if isinstance(metadata, str):
+            try:
+                metadata = json.loads(metadata)
+            except json.JSONDecodeError:
+                metadata = None
+        points = _parse_linestring_wkt(wkt)
+        runs.append(Run(link_id=link_id, points=points, metadata=metadata))
+
+    return runs
+
+
+def _drop_outlier_runs_by_endpoints(runs: List[Run], threshold_m: float = 25.0) -> List[Run]:
+    if len(runs) <= 2:
+        return runs
+
+    starts = [r.points[0] for r in runs if r.points]
+    ends = [r.points[-1] for r in runs if r.points]
+
+    if not starts or not ends:
+        return runs
+
+    start_med = {"lat": median(p["lat"] for p in starts), "lon": median(p["lon"] for p in starts)}
+    end_med = {"lat": median(p["lat"] for p in ends), "lon": median(p["lon"] for p in ends)}
+
+    filtered: List[Run] = []
+    for run in runs:
+        if not run.points:
+            continue
+        start_dist = _distance_m(run.points[0], start_med)
+        end_dist = _distance_m(run.points[-1], end_med)
+        if start_dist <= threshold_m and end_dist <= threshold_m:
+            filtered.append(run)
+
+    return filtered if filtered else runs
+
+
+def resample_polyline(points: Sequence[Point], k: int) -> List[Point]:
+    if k <= 0 or not points:
+        return []
+    if len(points) == 1:
+        return [points[0] for _ in range(k)]
+
+    cumdist = _cumulative_distances(points)
+    total_length = cumdist[-1]
+    if total_length == 0:
+        return [points[0] for _ in range(k)]
+
+    step = total_length / (k - 1) if k > 1 else total_length
+    targets = [step * i for i in range(k)]
+
+    resampled: List[Point] = []
+    seg_index = 0
+    for t in targets:
+        while seg_index < len(cumdist) - 1 and cumdist[seg_index + 1] < t:
+            seg_index += 1
+        next_idx = min(seg_index + 1, len(points) - 1)
+        prev_idx = seg_index
+        prev_d = cumdist[prev_idx]
+        next_d = cumdist[next_idx]
+        if next_d - prev_d == 0:
+            resampled.append(points[prev_idx])
+            continue
+        ratio = (t - prev_d) / (next_d - prev_d)
+        prev_p = points[prev_idx]
+        next_p = points[next_idx]
+        lat = prev_p["lat"] + (next_p["lat"] - prev_p["lat"]) * ratio
+        lon = prev_p["lon"] + (next_p["lon"] - prev_p["lon"]) * ratio
+        resampled.append({"lat": lat, "lon": lon})
+
+    return resampled
+
+
+def fuse_resampled(
+    runs: Sequence[Sequence[Point]],
+    drop_outlier_fraction: float = 0.25,
+    weights: Optional[Sequence[float]] = None,
+) -> List[Point]:
+    if not runs:
+        return []
+
+    lengths = {len(r) for r in runs}
+    if len(lengths) != 1:
+        raise ValueError("All resampled runs must have the same length")
+
+    if weights is None:
+        weights = [1.0 for _ in runs]
+    if len(weights) != len(runs):
+        raise ValueError("Weights length must match runs length")
+
+    fused: List[Point] = []
+    point_count = lengths.pop()
+
+    for idx in range(point_count):
+        points_at_idx = []
+        for run_idx, run in enumerate(runs):
+            if idx < len(run):
+                points_at_idx.append((run[idx], weights[run_idx]))
+
+        if not points_at_idx:
+            continue
+
+        median_point = {
+            "lat": median(p[0]["lat"] for p in points_at_idx),
+            "lon": median(p[0]["lon"] for p in points_at_idx),
+        }
+
+        distances = [(_distance_m(p, median_point), p, w) for p, w in points_at_idx]
+        distances.sort(key=lambda x: x[0])
+
+        keep_count = max(1, int(len(distances) * (1 - drop_outlier_fraction)))
+        kept = distances[:keep_count]
+
+        weight_sum = sum(w for _, _, w in kept)
+        if weight_sum == 0:
+            weight_sum = len(kept)
+            fused.append(
+                {
+                    "lat": sum(p["lat"] for _, p, _ in kept) / len(kept),
+                    "lon": sum(p["lon"] for _, p, _ in kept) / len(kept),
+                }
+            )
+            continue
+
+        avg_lat = sum(w * p["lat"] for _, p, w in kept) / weight_sum
+        avg_lon = sum(w * p["lon"] for _, p, w in kept) / weight_sum
+        fused.append({"lat": avg_lat, "lon": avg_lon})
+
+    return fused
+
+
+def smooth_polyline(points: Sequence[Point], iterations: int = 2) -> List[Point]:
+    if len(points) < 3:
+        return list(points)
+
+    smoothed = list(points)
+    for _ in range(iterations):
+        if len(smoothed) < 3:
+            break
+        new_points = [smoothed[0]]
+        for i in range(1, len(smoothed) - 1):
+            avg_lat = (
+                smoothed[i - 1]["lat"] + smoothed[i]["lat"] + smoothed[i + 1]["lat"]
+            ) / 3
+            avg_lon = (
+                smoothed[i - 1]["lon"] + smoothed[i]["lon"] + smoothed[i + 1]["lon"]
+            ) / 3
+            new_points.append({"lat": avg_lat, "lon": avg_lon})
+        new_points.append(smoothed[-1])
+        smoothed = new_points
+    return smoothed
+
+
+def write_unified_to_db(
+    conn: PGConnection,
+    points: Sequence[Point],
+    link_ids: Sequence[int],
+    resample_points: int,
+    weights: Optional[dict] = None,
+) -> int:
+    coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
+    wkt = f"LINESTRING({coords})"
+    metadata = {
+        "method": "multirun_centerline_v1.1",
+        "unified_from": list(link_ids),
+        "runs": list(link_ids),
+        "num_runs": len(link_ids),
+        "resample_points": resample_points,
+        "geodesic": True,
+        "direction_normalized": True,
+        "weights": weights or {},
+    }
+
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            INSERT INTO road_links_unified (
+                geom,
+                source,
+                metadata
+            )
+            VALUES (
+                ST_GeomFromText(%s, 4326),
+                'unified',
+                %s::jsonb
+            )
+            RETURNING link_id
+            """,
+            (wkt, json.dumps(metadata, ensure_ascii=False)),
+        )
+        new_id = cur.fetchone()[0]
+
+    return new_id
+
+
+def _mean_pairwise_endpoint_distance(runs: Sequence[Run]) -> float:
+    if len(runs) < 2:
+        return 0.0
+
+    distances = []
+    for i in range(len(runs)):
+        for j in range(i + 1, len(runs)):
+            if not runs[i].points or not runs[j].points:
+                continue
+            start_d = _distance_m(runs[i].points[0], runs[j].points[0])
+            end_d = _distance_m(runs[i].points[-1], runs[j].points[-1])
+            distances.append((start_d + end_d) / 2)
+    if not distances:
+        return 0.0
+    return sum(distances) / len(distances)
+
+
+def unify_runs(
+    link_ids: Sequence[int],
+    conn: Optional[PGConnection] = None,
+    resample_points: int = 100,
+) -> int:
+    if len(link_ids) < 2:
+        raise ValueError("At least two link_ids are required for unification")
+    if resample_points < 10:
+        raise ValueError("resample_points must be at least 10")
+    if conn is None:
+        raise ValueError("A database connection is required")
+
+    runs = load_runs_from_db(conn, link_ids)
+    if len(runs) < 2:
+        raise ValueError("Not enough runs found for the provided link_ids")
+
+    runs = _drop_outlier_runs_by_endpoints(runs)
+    if len(runs) < 2:
+        raise ValueError("Too few valid runs after outlier removal")
+
+    lengths = [_polyline_length(r.points) for r in runs]
+    if not lengths:
+        raise ValueError("Runs are empty")
+
+    min_len = min(lengths)
+    max_len = max(lengths)
+    if max_len == 0 or (max_len - min_len) / max_len > 0.4:
+        raise ValueError("Length difference between runs is too large")
+
+    # Normalize direction using the first run as reference
+    reference_points = runs[0].points
+    normalized_runs: List[Run] = [runs[0]]
+    for run in runs[1:]:
+        aligned_points = normalize_direction(reference_points, run.points)
+        normalized_runs.append(
+            Run(link_id=run.link_id, points=aligned_points, metadata=run.metadata)
+        )
+
+    if _mean_pairwise_endpoint_distance(normalized_runs) > 30.0:
+        raise ValueError("Runs appear to be too far apart to unify")
+
+    target_length = min_len
+    clipped = [
+        Run(
+            link_id=r.link_id,
+            points=_clip_to_length(r.points, target_length),
+            metadata=r.metadata,
+        )
+        for r in normalized_runs
+    ]
+
+    weights = [_run_weight(r) for r in clipped]
+    weight_map = {run.link_id: weight for run, weight in zip(clipped, weights)}
+
+    resampled = [resample_polyline(r.points, resample_points) for r in clipped]
+    fused = fuse_resampled(resampled, weights=weights)
+    smoothed = smooth_polyline(fused)
+
+    if len(smoothed) < 10:
+        raise ValueError("Unified centerline is too short")
+
+    used_ids = [r.link_id for r in clipped]
+    new_link_id = write_unified_to_db(
+        conn, smoothed, used_ids, resample_points, weights=weight_map
+    )
+    return new_link_id

@@ -6,3 +6,4 @@ geoalchemy2
 python-dotenv
 pytest
 httpx
+geographiclib
