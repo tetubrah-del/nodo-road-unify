@@ -34,6 +34,9 @@ class DummyConnection:
     def cursor(self, cursor_factory=None):
         return DummyCursor()
 
+    def commit(self):
+        return None
+
 
 @pytest.fixture(autouse=True)
 def stub_database(monkeypatch):
