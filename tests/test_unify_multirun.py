@@ -53,6 +53,42 @@ def test_fuse_resampled_uses_weights():
     assert fused[0]["lon"] < 0.4
 
 
+def test_fuse_resampled_huber_downweights_outlier():
+    good_runs = [
+        [{"lat": 0.0, "lon": 0.0}, {"lat": 0.0, "lon": 0.0}],
+        [{"lat": 0.00001, "lon": 0.00001}, {"lat": 0.00001, "lon": 0.00001}],
+        [{"lat": -0.00001, "lon": -0.00001}, {"lat": -0.00001, "lon": -0.00001}],
+    ]
+    mild_outlier = [[{"lat": 0.001, "lon": 0.001}, {"lat": 0.001, "lon": 0.001}]]
+
+    fused_mean = fuse_resampled(good_runs + mild_outlier, drop_outlier_fraction=0.0)
+    fused_huber = fuse_resampled(
+        good_runs + mild_outlier, drop_outlier_fraction=0.0, fusion_method="huber"
+    )
+
+    assert abs(fused_huber[0]["lat"]) < abs(fused_mean[0]["lat"])
+    assert abs(fused_huber[0]["lon"]) < abs(fused_mean[0]["lon"])
+
+
+def test_fuse_resampled_tukey_biases_toward_cluster():
+    cluster = [
+        [{"lat": 0.0, "lon": 0.0}, {"lat": 0.0, "lon": 0.0}],
+        [{"lat": 0.00002, "lon": 0.00002}, {"lat": 0.00002, "lon": 0.00002}],
+    ]
+    outliers = [
+        [{"lat": 0.0005, "lon": 0.0005}, {"lat": 0.0005, "lon": 0.0005}],
+        [{"lat": -0.0004, "lon": -0.0004}, {"lat": -0.0004, "lon": -0.0004}],
+    ]
+
+    fused_mean = fuse_resampled(cluster + outliers, drop_outlier_fraction=0.0)
+    fused_tukey = fuse_resampled(
+        cluster + outliers, drop_outlier_fraction=0.0, fusion_method="tukey"
+    )
+
+    assert abs(fused_tukey[0]["lat"]) < abs(fused_mean[0]["lat"])
+    assert abs(fused_tukey[0]["lon"]) < abs(fused_mean[0]["lon"])
+
+
 def test_smooth_polyline_reduces_peak():
     points = [
         {"lat": 0.0, "lon": 0.0},
