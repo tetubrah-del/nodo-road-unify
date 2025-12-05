@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 from pydantic import BaseModel
 
@@ -22,6 +22,20 @@ class DangerScoreParams(BaseModel):
     slope_scale: float = 15.0  # degrees
     min_width_m: float = 2.0
     max_width_m: float = 5.0
+
+
+class ReliabilityScoreParams(BaseModel):
+    """Weighting and normalization for reliability scoring."""
+
+    # weights for each component, should sum to ~1.0 but doesn’t have to
+    w_hmm: float = 0.4
+    w_alignment: float = 0.3
+    w_run_count: float = 0.2
+    w_sensor_mode: float = 0.1
+
+    # Expected ranges / scales for normalization
+    max_alignment_cost: float = 1.0  # after normalization from DTW
+    max_runs_for_full_confidence: int = 5
 
 
 @dataclass
@@ -129,7 +143,7 @@ def compute_danger_score_v3(
     sensor_summary: Optional[dict],
     quality_info: Optional[dict],
     params: DangerScoreParams,
-) -> float:
+    ) -> float:
     """Compute a v3 danger score in the range [1.0, 5.0]."""
 
     score, _components = compute_danger_components(
@@ -141,3 +155,79 @@ def compute_danger_score_v3(
         params=params,
     )
     return score
+
+
+def compute_reliability_components(
+    *,
+    hmm_info: Optional[Dict[str, Any]],
+    alignment_stats: Optional[Dict[str, Any]],
+    run_count: int,
+    sensor_mode_stats: Optional[Dict[str, int]],
+    params: ReliabilityScoreParams,
+) -> Tuple[float, Dict[str, float]]:
+    """Compute the reliability score and component contributions."""
+
+    hmm_score = 0.5
+    if isinstance(hmm_info, dict):
+        match_ratio = hmm_info.get("match_ratio") or hmm_info.get("matched_ratio")
+        if match_ratio is not None:
+            hmm_score = float(match_ratio)
+    hmm_score = max(0.0, min(1.0, hmm_score))
+
+    alignment_score = 0.5
+    if isinstance(alignment_stats, dict):
+        cost = alignment_stats.get("mean_cost")
+        if cost is None:
+            cost = alignment_stats.get("max_cost")
+        if cost is not None:
+            norm = min(1.0, float(cost) / params.max_alignment_cost)
+            alignment_score = 1.0 - norm
+
+    capped = min(max(run_count, 0), params.max_runs_for_full_confidence)
+    run_count_score = capped / params.max_runs_for_full_confidence
+
+    sensor_score = 0.5
+    if isinstance(sensor_mode_stats, dict):
+        vehicle = sensor_mode_stats.get("vehicle", 0)
+        gps_only = sensor_mode_stats.get("gps_only", 0)
+        total = vehicle + gps_only
+        if total > 0:
+            vehicle_ratio = vehicle / total
+            sensor_score = 0.5 + 0.5 * vehicle_ratio
+
+    reliability = (
+        params.w_hmm * hmm_score
+        + params.w_alignment * alignment_score
+        + params.w_run_count * run_count_score
+        + params.w_sensor_mode * sensor_score
+    )
+    reliability = max(0.0, min(1.0, reliability))
+
+    components = {
+        "hmm": hmm_score,
+        "alignment": alignment_score,
+        "run_count": run_count_score,
+        "sensor_mode": sensor_score,
+    }
+
+    return reliability, components
+
+
+def compute_reliability_score(
+    *,
+    hmm_info: Optional[Dict[str, Any]],
+    alignment_stats: Optional[Dict[str, Any]],
+    run_count: int,
+    sensor_mode_stats: Optional[Dict[str, int]],
+    params: ReliabilityScoreParams,
+) -> float:
+    """Compute a reliability score in the range [0.0, 1.0]."""
+
+    reliability, _components = compute_reliability_components(
+        hmm_info=hmm_info,
+        alignment_stats=alignment_stats,
+        run_count=run_count,
+        sensor_mode_stats=sensor_mode_stats,
+        params=params,
+    )
+    return reliability
