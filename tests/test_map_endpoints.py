@@ -1,7 +1,12 @@
 import pytest
-from fastapi.testclient import TestClient
+
+try:
+    from fastapi.testclient import TestClient
+except RuntimeError:
+    pytest.skip("httpx is not available", allow_module_level=True)
 
 import main
+import unify_multirun
 
 
 class DummyCursor:
@@ -34,6 +39,10 @@ class DummyConnection:
 def stub_database(monkeypatch):
     dummy_conn = DummyConnection()
     monkeypatch.setattr(main, "get_connection", lambda: dummy_conn)
+    monkeypatch.setattr(
+        unify_multirun, "unify_runs", lambda link_ids, conn=None, resample_points=100: 999
+    )
+    monkeypatch.setattr(main, "unify_runs", lambda link_ids, conn=None, resample_points=100: 999)
     yield
 
 
@@ -66,3 +75,12 @@ def test_unified_roads_feature_collection(client):
     assert response.status_code == 200
     assert body.get("type") == "FeatureCollection"
     assert isinstance(body.get("features"), list)
+
+
+def test_multirun_unify_endpoint(client):
+    response = client.post("/api/unify/multirun", json={"link_ids": [1, 2, 3]})
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body.get("status") == "ok"
+    assert body.get("unified_link_id") == 999
