@@ -45,6 +45,9 @@ class MultirunParams(BaseModel):
     min_coverage_ratio: Optional[float] = None
     reference_method: Literal["best_quality", "medoid"] = "best_quality"
     align_method: Literal["index", "dtw"] = "index"
+    fusion_method: Literal["mean", "median", "huber", "tukey"] = "mean"
+    huber_delta: float = 0.00002
+    tukey_c: float = 0.00002
 
 
 @dataclass
@@ -696,8 +699,79 @@ def _smooth_profile(values: Sequence[Optional[float]], window: int) -> List[Opti
     return smoothed
 
 
+def _weighted_mean(values: Sequence[float], weights: Sequence[float]) -> float:
+    weight_sum = sum(weights)
+    if weight_sum == 0:
+        return sum(values) / len(values)
+    return sum(v * w for v, w in zip(values, weights)) / weight_sum
+
+
+def _weighted_median(values: Sequence[float], weights: Sequence[float]) -> float:
+    sorted_pairs = sorted(zip(values, weights), key=lambda vw: vw[0])
+    total_weight = sum(weights)
+    cumulative = 0.0
+    for value, weight in sorted_pairs:
+        cumulative += weight
+        if cumulative >= total_weight / 2:
+            return value
+    return sorted_pairs[-1][0]
+
+
+def fuse_values(
+    values: Sequence[float],
+    method: Literal["mean", "median", "huber", "tukey"],
+    *,
+    weights: Optional[Sequence[float]] = None,
+    huber_delta: float = 0.00002,
+    tukey_c: float = 0.00002,
+    iterations: int = 5,
+) -> float:
+    if not values:
+        return 0.0
+
+    if weights is None:
+        weights = [1.0 for _ in values]
+    if len(weights) != len(values):
+        raise ValueError("Weights length must match values length")
+
+    if method == "mean":
+        return _weighted_mean(values, weights)
+
+    if method == "median":
+        return _weighted_median(values, weights)
+
+    mu = _weighted_mean(values, weights)
+    if method == "tukey":
+        scale = tukey_c if tukey_c > 0 else 1e-6
+    else:
+        scale = huber_delta if huber_delta > 0 else 1e-6
+
+    for _ in range(max(1, iterations)):
+        influences: List[float] = []
+        for v, base_w in zip(values, weights):
+            if method == "huber":
+                residual = v - mu
+                abs_r = abs(residual)
+                influence = 1.0 if abs_r <= scale else scale / abs_r
+            else:
+                r = (v - mu) / scale
+                influence = (1 - r**2) ** 2 if abs(r) < 1 else 0.0
+            influences.append(base_w * influence)
+
+        weight_sum = sum(influences)
+        if weight_sum == 0:
+            break
+        mu = _weighted_mean(values, influences)
+
+    return mu
+
+
 def _fuse_points(
-    points_with_weights: Sequence[Tuple[Point, float]], drop_outlier_fraction: float
+    points_with_weights: Sequence[Tuple[Point, float]],
+    drop_outlier_fraction: float,
+    fusion_method: Literal["mean", "median", "huber", "tukey"] = "mean",
+    huber_delta: float = 0.00002,
+    tukey_c: float = 0.00002,
 ) -> Optional[Point]:
     if not points_with_weights:
         return None
@@ -715,17 +789,25 @@ def _fuse_points(
     keep_count = max(1, int(len(distances) * (1 - drop_outlier_fraction)))
     kept = distances[:keep_count]
 
-    weight_sum = sum(w for _, _, w in kept)
-    if weight_sum == 0:
-        weight_sum = len(kept)
-        return {
-            "lat": sum(p["lat"] for _, p, _ in kept) / len(kept),
-            "lon": sum(p["lon"] for _, p, _ in kept) / len(kept),
-        }
+    values_lat = [p["lat"] for _, p, _ in kept]
+    values_lon = [p["lon"] for _, p, _ in kept]
+    weights = [w for _, _, w in kept]
 
-    avg_lat = sum(w * p["lat"] for _, p, w in kept) / weight_sum
-    avg_lon = sum(w * p["lon"] for _, p, w in kept) / weight_sum
-    return {"lat": avg_lat, "lon": avg_lon}
+    fused_lat = fuse_values(
+        values_lat,
+        fusion_method,
+        weights=weights,
+        huber_delta=huber_delta,
+        tukey_c=tukey_c,
+    )
+    fused_lon = fuse_values(
+        values_lon,
+        fusion_method,
+        weights=weights,
+        huber_delta=huber_delta,
+        tukey_c=tukey_c,
+    )
+    return {"lat": fused_lat, "lon": fused_lon}
 
 
 def estimate_width_profile(
@@ -780,6 +862,9 @@ def fuse_resampled(
     runs: Sequence[Sequence[Point]],
     drop_outlier_fraction: float = 0.25,
     weights: Optional[Sequence[float]] = None,
+    fusion_method: Literal["mean", "median", "huber", "tukey"] = "mean",
+    huber_delta: float = 0.00002,
+    tukey_c: float = 0.00002,
 ) -> List[Point]:
     if not runs:
         return []
@@ -802,7 +887,13 @@ def fuse_resampled(
             if idx < len(run):
                 points_at_idx.append((run[idx], weights[run_idx]))
 
-        fused_point = _fuse_points(points_at_idx, drop_outlier_fraction)
+        fused_point = _fuse_points(
+            points_at_idx,
+            drop_outlier_fraction,
+            fusion_method=fusion_method,
+            huber_delta=huber_delta,
+            tukey_c=tukey_c,
+        )
         if fused_point:
             fused.append(fused_point)
 
@@ -815,6 +906,9 @@ def fuse_aligned_runs(
     alignments: dict[int, List[int]],
     drop_outlier_fraction: float = 0.25,
     weights: Optional[dict[int, float]] = None,
+    fusion_method: Literal["mean", "median", "huber", "tukey"] = "mean",
+    huber_delta: float = 0.00002,
+    tukey_c: float = 0.00002,
 ) -> List[Point]:
     if not reference_run.points:
         return []
@@ -840,7 +934,13 @@ def fuse_aligned_runs(
 
     fused: List[Point] = []
     for bucket in buckets:
-        fused_point = _fuse_points(bucket, drop_outlier_fraction)
+        fused_point = _fuse_points(
+            bucket,
+            drop_outlier_fraction,
+            fusion_method=fusion_method,
+            huber_delta=huber_delta,
+            tukey_c=tukey_c,
+        )
         if fused_point:
             fused.append(fused_point)
 
@@ -903,6 +1003,7 @@ def write_unified_to_db(
     width_profile: Optional[dict] = None,
     hmm: Optional[dict] = None,
     removed_runs: Optional[List[dict]] = None,
+    fusion: Optional[dict] = None,
 ) -> int:
     coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
     wkt = f"LINESTRING({coords})"
@@ -922,6 +1023,8 @@ def write_unified_to_db(
         metadata["hmm"] = hmm
     if removed_runs:
         metadata["removed_runs"] = removed_runs
+    if fusion:
+        metadata["fusion"] = fusion
 
     with conn.cursor() as cur:
         cur.execute(
@@ -1182,6 +1285,9 @@ def unify_runs(
         other_resampled,
         alignments,
         weights=weight_map,
+        fusion_method=params.fusion_method,
+        huber_delta=params.huber_delta,
+        tukey_c=params.tukey_c,
     )
     smoothed = smooth_polyline(fused)
 
@@ -1199,6 +1305,11 @@ def unify_runs(
         raise ValueError("Unified centerline is too short")
 
     used_ids = [r.link_id for r in clipped]
+    fusion_info = {
+        "method": params.fusion_method,
+        "huber_delta": params.huber_delta,
+        "tukey_c": params.tukey_c,
+    }
     new_link_id = write_unified_to_db(
         conn,
         smoothed,
@@ -1215,5 +1326,6 @@ def unify_runs(
             }
             for stats in removed_stats
         ],
+        fusion=fusion_info,
     )
     return {"unified_link_id": new_link_id, "hmm": hmm_summary}
