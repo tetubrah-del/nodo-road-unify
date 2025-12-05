@@ -2,6 +2,7 @@ import pytest
 
 from unify_multirun import (
     fuse_resampled,
+    map_match_runs_with_hmm,
     normalize_direction,
     resample_polyline,
     smooth_polyline,
@@ -67,3 +68,40 @@ def test_normalize_direction_reverses_when_closer():
     normalized = normalize_direction(reference, candidate)
 
     assert normalized[0] == candidate[-1]
+
+
+def test_map_match_runs_with_hmm_prefers_close_candidate():
+    run = [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.0, "lon": 0.0005},
+        {"lat": 0.0, "lon": 0.001},
+    ]
+
+    summary = map_match_runs_with_hmm(
+        [run],
+        [
+            (99, [{"lat": 1.0, "lon": 1.0}, {"lat": 1.0, "lon": 1.001}]),
+            (1, [{"lat": 0.0, "lon": 0.0}, {"lat": 0.0, "lon": 0.001}]),
+        ],
+        max_link_distance_m=200.0,
+    )
+
+    assert summary["matched_link_id"] == 1
+    assert summary["matched_ratio"] is not None
+    assert summary["matched_ratio"] > 0.8
+
+
+def test_map_match_runs_with_hmm_returns_none_when_far():
+    run = [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.0, "lon": 0.0005},
+        {"lat": 0.0, "lon": 0.001},
+    ]
+
+    summary = map_match_runs_with_hmm(
+        [run],
+        [(2, [{"lat": 5.0, "lon": 5.0}, {"lat": 5.0, "lon": 5.001}])],
+        max_link_distance_m=20.0,
+    )
+
+    assert summary["matched_link_id"] is None

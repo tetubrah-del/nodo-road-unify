@@ -40,9 +40,21 @@ def stub_database(monkeypatch):
     dummy_conn = DummyConnection()
     monkeypatch.setattr(main, "get_connection", lambda: dummy_conn)
     monkeypatch.setattr(
-        unify_multirun, "unify_runs", lambda link_ids, conn=None, resample_points=100: 999
+        unify_multirun,
+        "unify_runs",
+        lambda link_ids, conn=None, resample_points=100, estimate_width=True, use_hmm=False, hmm_debug=False: {
+            "unified_link_id": 999,
+            "hmm": {"enabled": bool(use_hmm), "matched_link_id": None, "matched_ratio": 0.5},
+        },
     )
-    monkeypatch.setattr(main, "unify_runs", lambda link_ids, conn=None, resample_points=100: 999)
+    monkeypatch.setattr(
+        main,
+        "unify_runs",
+        lambda link_ids, conn=None, resample_points=100, estimate_width=True, use_hmm=False, hmm_debug=False: {
+            "unified_link_id": 999,
+            "hmm": {"enabled": bool(use_hmm), "matched_link_id": None, "matched_ratio": 0.5},
+        },
+    )
     yield
 
 
@@ -84,3 +96,17 @@ def test_multirun_unify_endpoint(client):
     assert response.status_code == 200
     assert body.get("status") == "ok"
     assert body.get("unified_link_id") == 999
+
+
+def test_multirun_unify_endpoint_hmm_debug(client):
+    response = client.post(
+        "/api/unify/multirun", json={"link_ids": [1, 2]}, params={"use_hmm": True, "hmm_debug": True}
+    )
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body.get("unified_link_id") == 999
+    assert isinstance(body.get("hmm"), dict)
+    assert body["hmm"].get("enabled") is True
+    assert "matched_link_id" in body["hmm"]
+    assert "matched_ratio" in body["hmm"]

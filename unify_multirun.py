@@ -2,7 +2,7 @@ import json
 import math
 from dataclasses import dataclass
 from statistics import median
-from typing import Iterable, List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 from psycopg2.extras import RealDictCursor
 from psycopg2.extensions import connection as PGConnection
@@ -16,9 +16,11 @@ from geodesic_utils import (
     polyline_length,
     resample_polyline,
 )
+from hmm_map_matching import emission_probability, hmm_viterbi, transition_probability
 
 
 Point = dict
+CollectorPoint = Point
 
 
 @dataclass
@@ -30,6 +32,12 @@ class Run:
 
 def _distance_m(p1: Point, p2: Point) -> float:
     return geodesic_distance_m(p1["lat"], p1["lon"], p2["lat"], p2["lon"])
+
+
+def _nearest_distance_to_centerline(point: Point, centerline: Sequence[Point]) -> float:
+    if not centerline:
+        return math.inf
+    return min(_distance_m(point, c) for c in centerline)
 
 
 def _parse_linestring_wkt(wkt: str) -> List[Point]:
@@ -504,6 +512,7 @@ def write_unified_to_db(
     resample_points: int,
     weights: Optional[dict] = None,
     width_profile: Optional[dict] = None,
+    hmm: Optional[dict] = None,
 ) -> int:
     coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
     wkt = f"LINESTRING({coords})"
@@ -519,6 +528,8 @@ def write_unified_to_db(
     }
     if width_profile:
         metadata["width_profile"] = width_profile
+    if hmm:
+        metadata["hmm"] = hmm
 
     with conn.cursor() as cur:
         cur.execute(
@@ -559,12 +570,97 @@ def _mean_pairwise_endpoint_distance(runs: Sequence[Run]) -> float:
     return sum(distances) / len(distances)
 
 
+def _link_distance_score(points: Sequence[Point], centerline: Sequence[Point]) -> float:
+    if not points or not centerline:
+        return math.inf
+    distances = [_nearest_distance_to_centerline(pt, centerline) for pt in points]
+    if not distances:
+        return math.inf
+    return sum(distances) / len(distances)
+
+
+def map_match_runs_with_hmm(
+    runs: List[List[CollectorPoint]],
+    candidate_links: List[Tuple[int, List[CollectorPoint]]],
+    *,
+    max_link_distance_m: float = 50.0,
+) -> dict:
+    """
+    Use a simple HMM to map-match multiple runs against candidate centerlines.
+
+    Returns a summary containing the matched link id and lightweight quality
+    metrics. If no reasonable candidate exists, matched_link_id will be None.
+    """
+
+    summary = {
+        "matched_link_id": None,
+        "log_likelihood": None,
+        "avg_emission_prob": None,
+        "matched_ratio": None,
+    }
+
+    if not runs or not candidate_links:
+        return summary
+
+    best: Tuple[float, Optional[int], dict] = (-math.inf, None, summary)
+
+    for link_id, centerline in candidate_links:
+        if not centerline:
+            continue
+
+        total_points = 0
+        matched_points = 0
+        emission_sum = 0.0
+        log_likelihood = 0.0
+
+        avg_dist = _link_distance_score([pt for run in runs for pt in run], centerline)
+        if avg_dist > max_link_distance_m:
+            continue
+
+        for run in runs:
+            if not run:
+                continue
+            total_points += len(run)
+            path = hmm_viterbi(run, centerline, sigma=8.0, delta_d=1.0)
+            if not path:
+                continue
+            matched_points += len(path)
+            for obs, state_idx in zip(run, path):
+                prob = emission_probability(obs, centerline[state_idx], sigma=8.0)
+                emission_sum += prob
+                log_likelihood += math.log(prob + 1e-12)
+            for prev, curr in zip(path, path[1:]):
+                log_likelihood += math.log(transition_probability(prev, curr, delta_d=1.0) + 1e-12)
+
+        if total_points == 0 or matched_points == 0:
+            continue
+
+        avg_emission = emission_sum / matched_points
+        matched_ratio = matched_points / total_points if total_points else None
+
+        if log_likelihood > best[0]:
+            best = (
+                log_likelihood,
+                link_id,
+                {
+                    "matched_link_id": link_id,
+                    "log_likelihood": float(log_likelihood),
+                    "avg_emission_prob": float(avg_emission),
+                    "matched_ratio": float(matched_ratio) if matched_ratio is not None else None,
+                },
+            )
+
+    return best[2] if best[1] is not None else summary
+
+
 def unify_runs(
     link_ids: Sequence[int],
     conn: Optional[PGConnection] = None,
     resample_points: int = 100,
     estimate_width: bool = True,
-) -> int:
+    use_hmm: bool = False,
+    hmm_debug: bool = False,
+) -> dict:
     if len(link_ids) < 2:
         raise ValueError("At least two link_ids are required for unification")
     if resample_points < 10:
@@ -620,6 +716,14 @@ def unify_runs(
 
     width_profile = estimate_width_profile(smoothed, clipped) if estimate_width else None
 
+    hmm_summary = {"enabled": bool(use_hmm)}
+    if use_hmm:
+        candidate_links = [(r.link_id, r.points) for r in clipped]
+        hmm_result = map_match_runs_with_hmm(
+            [r.points for r in clipped], candidate_links
+        )
+        hmm_summary.update(hmm_result)
+
     if len(smoothed) < 10:
         raise ValueError("Unified centerline is too short")
 
@@ -631,5 +735,6 @@ def unify_runs(
         resample_points,
         weights=weight_map,
         width_profile=width_profile,
+        hmm=hmm_summary if (use_hmm or hmm_debug) else None,
     )
-    return new_link_id
+    return {"unified_link_id": new_link_id, "hmm": hmm_summary}
