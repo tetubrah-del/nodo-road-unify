@@ -12,6 +12,11 @@ from psycopg2.extensions import connection as PGConnection
 from pydantic import BaseModel, Field
 
 from danger_score_utils import compute_danger_score_v2
+from danger_scoring import (
+    DangerScoreParams,
+    compute_danger_components,
+    compute_danger_score_v3,
+)
 import unify_multirun
 from unify_multirun import unify_runs
 
@@ -56,6 +61,79 @@ def get_conn():
 def get_connection():
     """PostGIS へのコネクションを返すヘルパー"""
     return get_conn()
+
+
+def _safe_mapping(value):
+    return value if isinstance(value, dict) else None
+
+
+def recompute_unified_danger_scores(
+    params: DangerScoreParams, conn: PGConnection | None = None
+) -> int:
+    """Recompute danger_score_v3 for all unified links.
+
+    Returns the number of rows updated.
+    """
+
+    managed_conn = conn or get_connection()
+    close_conn = conn is None
+    updated = 0
+
+    try:
+        with managed_conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT link_id, width_m, slope_deg, curvature, metadata
+                FROM road_links_unified
+                """
+            )
+            rows = cur.fetchall()
+
+        with managed_conn.cursor() as cur:
+            for row in rows:
+                metadata = safe_dict(row.get("metadata"))
+                sensor_summary = _safe_mapping(metadata.get("sensor_summary"))
+                quality_info = _safe_mapping(metadata.get("quality")) or _safe_mapping(
+                    metadata.get("quality_info")
+                )
+
+                score, components = compute_danger_components(
+                    curvature=row.get("curvature"),
+                    slope_deg=row.get("slope_deg"),
+                    width_m=row.get("width_m"),
+                    sensor_summary=sensor_summary,
+                    quality_info=quality_info,
+                    params=params,
+                )
+
+                metadata["danger_v3"] = {
+                    "score": score,
+                    "version": 3,
+                    "components": {
+                        "roughness": components.roughness,
+                        "curvature": components.curvature,
+                        "slope": components.slope,
+                        "width": components.width,
+                        "quality_penalty": components.quality_penalty,
+                    },
+                }
+
+                cur.execute(
+                    """
+                    UPDATE road_links_unified
+                    SET danger_score = %s, metadata = %s::jsonb
+                    WHERE link_id = %s
+                    """,
+                    (score, json.dumps(metadata, ensure_ascii=False), row["link_id"]),
+                )
+                updated += 1
+
+        managed_conn.commit()
+    finally:
+        if close_conn:
+            managed_conn.close()
+
+    return updated
 
 
 # === Models (kept for compatibility) ===
@@ -408,6 +486,13 @@ def snap_linestring_to_unified_roads(
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/admin/recompute_unified_danger_v3")
+def api_recompute_unified_danger_v3():
+    params = DangerScoreParams()
+    updated = recompute_unified_danger_scores(params)
+    return {"updated": updated}
 
 
 @app.post("/api/unify/multirun")
