@@ -6,25 +6,16 @@ from typing import Iterable, List, Optional, Sequence
 
 from psycopg2.extras import RealDictCursor
 from psycopg2.extensions import connection as PGConnection
-try:
-    from geographiclib.geodesic import Geodesic
-except ModuleNotFoundError:  # pragma: no cover - fallback for offline environments
-    class _FallbackGeodesic:
-        @staticmethod
-        def Inverse(lat1: float, lon1: float, lat2: float, lon2: float) -> dict:
-            lat1_rad = math.radians(lat1)
-            lat2_rad = math.radians(lat2)
-            d_lat = lat2_rad - lat1_rad
-            d_lon = math.radians(lon2 - lon1)
-            a = (
-                math.sin(d_lat / 2) ** 2
-                + math.cos(lat1_rad) * math.cos(lat2_rad) * math.sin(d_lon / 2) ** 2
-            )
-            c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-            return {"s12": 6378137.0 * c}
 
-    class Geodesic:  # type: ignore
-        WGS84 = _FallbackGeodesic()
+from geodesic_utils import (
+    Geodesic,
+    average_speed_mps,
+    cumulative_distances,
+    geodesic_distance_m,
+    initial_bearing_deg,
+    polyline_length,
+    resample_polyline,
+)
 
 
 Point = dict
@@ -35,11 +26,6 @@ class Run:
     link_id: int
     points: List[Point]
     metadata: Optional[dict] = None
-
-
-def geodesic_distance_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
-    g = Geodesic.WGS84.Inverse(lat1, lon1, lat2, lon2)
-    return g["s12"]
 
 
 def _distance_m(p1: Point, p2: Point) -> float:
@@ -64,39 +50,16 @@ def _parse_linestring_wkt(wkt: str) -> List[Point]:
 
 
 def _polyline_length(points: Sequence[Point]) -> float:
-    if len(points) < 2:
-        return 0.0
-
-    total = 0.0
-    for i in range(len(points) - 1):
-        total += _distance_m(points[i], points[i + 1])
-    return total
+    return polyline_length(points)
 
 
 def _cumulative_distances(points: Sequence[Point]) -> List[float]:
-    if not points:
-        return []
-
-    dists = [0.0]
-    for i in range(1, len(points)):
-        dists.append(dists[-1] + _distance_m(points[i - 1], points[i]))
-    return dists
+    return cumulative_distances(points)
 
 
 def _average_speed_mps(points: Sequence[Point]) -> Optional[float]:
-    if len(points) < 2:
-        return None
-
-    timestamps = [p.get("timestamp_ms") for p in points]
-    if any(ts is None for ts in timestamps):
-        return None
-
-    duration_ms = points[-1].get("timestamp_ms") - points[0].get("timestamp_ms")
-    if duration_ms is None or duration_ms <= 0:
-        return None
-
-    total_distance = _polyline_length(points)
-    return total_distance / (duration_ms / 1000.0)
+    speed = average_speed_mps(points)
+    return speed if speed > 0 else None
 
 
 def _sensor_weight(metadata: Optional[dict]) -> float:
@@ -118,8 +81,33 @@ def _sensor_weight(metadata: Optional[dict]) -> float:
     return 0.7
 
 
+def _gps_accuracy_weight(run: Run) -> float:
+    hdops = [p.get("hdop") for p in run.points if isinstance(p.get("hdop"), (int, float))]
+    accuracies = [
+        p.get("accuracy")
+        for p in run.points
+        if isinstance(p.get("accuracy"), (int, float)) and p.get("accuracy") >= 0
+    ]
+
+    value: Optional[float] = None
+    if hdops:
+        value = median(hdops)
+    elif accuracies:
+        value = median(accuracies)
+    elif isinstance(run.metadata, dict):
+        meta_hdop = run.metadata.get("hdop")
+        if isinstance(meta_hdop, (int, float)):
+            value = meta_hdop
+
+    if value is None:
+        return 1.0
+
+    return max(0.1, 1.0 / (1.0 + value))
+
+
 def _run_weight(run: Run) -> float:
     w_base = 1.0
+    w_gps = _gps_accuracy_weight(run)
     speed = _average_speed_mps(run.points)
     if speed is None:
         w_speed = 1.0
@@ -132,7 +120,7 @@ def _run_weight(run: Run) -> float:
 
     w_sensor = _sensor_weight(run.metadata)
 
-    return w_base * w_speed * w_sensor
+    return w_base * w_gps * w_speed * w_sensor
 
 
 def normalize_direction(reference_points: Sequence[Point], candidate_points: Sequence[Point]) -> List[Point]:
@@ -301,6 +289,134 @@ def resample_polyline(points: Sequence[Point], k: int) -> List[Point]:
     return resampled
 
 
+def _nearest_centerline_index(point: Point, centerline: Sequence[Point]) -> int:
+    best_idx = 0
+    best_dist = math.inf
+    for idx, c in enumerate(centerline):
+        dist = _distance_m(point, c)
+        if dist < best_dist:
+            best_dist = dist
+            best_idx = idx
+    return best_idx
+
+
+def _heading_at_index(centerline: Sequence[Point], idx: int) -> float:
+    if not centerline:
+        return 0.0
+    if idx <= 0:
+        target = min(1, len(centerline) - 1)
+        return initial_bearing_deg(
+            centerline[0]["lat"],
+            centerline[0]["lon"],
+            centerline[target]["lat"],
+            centerline[target]["lon"],
+        )
+    if idx >= len(centerline) - 1:
+        prev = max(len(centerline) - 2, 0)
+        return initial_bearing_deg(
+            centerline[prev]["lat"],
+            centerline[prev]["lon"],
+            centerline[-1]["lat"],
+            centerline[-1]["lon"],
+        )
+
+    return initial_bearing_deg(
+        centerline[idx - 1]["lat"],
+        centerline[idx - 1]["lon"],
+        centerline[idx + 1]["lat"],
+        centerline[idx + 1]["lon"],
+    )
+
+
+def _signed_offset(point: Point, centerline: Sequence[Point], idx: int) -> float:
+    anchor = centerline[idx]
+    heading = _heading_at_index(centerline, idx)
+    to_point_bearing = initial_bearing_deg(
+        anchor["lat"], anchor["lon"], point["lat"], point["lon"]
+    )
+    angle_diff = math.radians(to_point_bearing - heading)
+    distance = _distance_m(anchor, point)
+    return distance * math.sin(angle_diff)
+
+
+def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
+    if not values:
+        return None
+    sorted_vals = sorted(values)
+    k = (len(sorted_vals) - 1) * percentile / 100.0
+    f = math.floor(k)
+    c = math.ceil(k)
+    if f == c:
+        return sorted_vals[int(k)]
+    d0 = sorted_vals[f] * (c - k)
+    d1 = sorted_vals[c] * (k - f)
+    return d0 + d1
+
+
+def _smooth_profile(values: Sequence[Optional[float]], window: int) -> List[Optional[float]]:
+    if window <= 1:
+        return list(values)
+    smoothed: List[Optional[float]] = []
+    half = window // 2
+    for idx in range(len(values)):
+        start = max(0, idx - half)
+        end = min(len(values), idx + half + 1)
+        window_vals = [v for v in values[start:end] if v is not None]
+        if not window_vals:
+            smoothed.append(None)
+            continue
+        smoothed.append(sum(window_vals) / len(window_vals))
+    return smoothed
+
+
+def estimate_width_profile(
+    centerline: Sequence[Point],
+    runs: Sequence[Run],
+    search_radius_m: float = 12.0,
+    percentile: float = 95.0,
+    smooth_window: int = 5,
+) -> Optional[dict]:
+    if not centerline or not runs:
+        return None
+
+    buckets: List[List[float]] = [[] for _ in centerline]
+    for run in runs:
+        for pt in run.points:
+            idx = _nearest_centerline_index(pt, centerline)
+            anchor = centerline[idx]
+            if _distance_m(pt, anchor) > search_radius_m:
+                continue
+            buckets[idx].append(_signed_offset(pt, centerline, idx))
+
+    left = [_percentile([v for v in bucket if v < 0], percentile) for bucket in buckets]
+    right = [_percentile([v for v in bucket if v > 0], percentile) for bucket in buckets]
+
+    left_smoothed = _smooth_profile(left, smooth_window)
+    right_smoothed = _smooth_profile(right, smooth_window)
+
+    width: List[Optional[float]] = []
+    for l, r in zip(left_smoothed, right_smoothed):
+        if l is None and r is None:
+            width.append(None)
+        elif l is None:
+            width.append(r)
+        elif r is None:
+            width.append(-l)
+        else:
+            width.append(r - l)
+
+    points = []
+    for idx, (l, r, w) in enumerate(zip(left_smoothed, right_smoothed, width)):
+        if w is None:
+            continue
+        points.append({"index": idx, "width_m": w, "left": l or 0.0, "right": r or 0.0})
+
+    if not points:
+        return None
+
+    return {"points": points, "method": "boundary_percentile95"}
+
+
 def fuse_resampled(
     runs: Sequence[Sequence[Point]],
     drop_outlier_fraction: float = 0.25,
@@ -387,11 +503,12 @@ def write_unified_to_db(
     link_ids: Sequence[int],
     resample_points: int,
     weights: Optional[dict] = None,
+    width_profile: Optional[dict] = None,
 ) -> int:
     coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
     wkt = f"LINESTRING({coords})"
     metadata = {
-        "method": "multirun_centerline_v1.1",
+        "method": "multirun_centerline_v2.0",
         "unified_from": list(link_ids),
         "runs": list(link_ids),
         "num_runs": len(link_ids),
@@ -400,6 +517,8 @@ def write_unified_to_db(
         "direction_normalized": True,
         "weights": weights or {},
     }
+    if width_profile:
+        metadata["width_profile"] = width_profile
 
     with conn.cursor() as cur:
         cur.execute(
@@ -444,6 +563,7 @@ def unify_runs(
     link_ids: Sequence[int],
     conn: Optional[PGConnection] = None,
     resample_points: int = 100,
+    estimate_width: bool = True,
 ) -> int:
     if len(link_ids) < 2:
         raise ValueError("At least two link_ids are required for unification")
@@ -498,11 +618,18 @@ def unify_runs(
     fused = fuse_resampled(resampled, weights=weights)
     smoothed = smooth_polyline(fused)
 
+    width_profile = estimate_width_profile(smoothed, clipped) if estimate_width else None
+
     if len(smoothed) < 10:
         raise ValueError("Unified centerline is too short")
 
     used_ids = [r.link_id for r in clipped]
     new_link_id = write_unified_to_db(
-        conn, smoothed, used_ids, resample_points, weights=weight_map
+        conn,
+        smoothed,
+        used_ids,
+        resample_points,
+        weights=weight_map,
+        width_profile=width_profile,
     )
     return new_link_id
