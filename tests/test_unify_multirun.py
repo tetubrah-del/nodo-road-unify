@@ -1,10 +1,13 @@
 import pytest
 
+from statistics import median
+
 from geodesic_utils import geodesic_distance_m
 from unify_multirun import (
     MultirunParams,
     Run,
     RunQualityStats,
+    build_run_quality_stats,
     build_alignment_mappings,
     compute_and_filter_runs_by_quality,
     compute_run_quality,
@@ -163,10 +166,11 @@ def test_dtw_alignment_straight_line_monotonic_and_close():
         {"lat": 0.00001, "lon": i * 0.000025} for i in range(40)
     ]
 
-    mapping = dtw_align_run_to_reference(ref_points, run_points)
+    mapping, cost = dtw_align_run_to_reference(ref_points, run_points)
 
     assert len(mapping) == len(run_points)
     assert mapping == sorted(mapping)
+    assert cost < 10.0
     assert all(
         geodesic_distance_m(run_points[i]["lat"], run_points[i]["lon"], ref_points[mapping[i]]["lat"], ref_points[mapping[i]]["lon"]) < 5.0
         for i in range(len(run_points))
@@ -187,11 +191,12 @@ def test_dtw_alignment_handles_shifted_curve():
         {"lat": 0.00155, "lon": 0.00018},
     ]
 
-    mapping = dtw_align_run_to_reference(reference, shifted_run)
+    mapping, cost = dtw_align_run_to_reference(reference, shifted_run)
 
     assert mapping == sorted(mapping)
     assert len(mapping) == len(shifted_run)
     assert max(mapping) <= len(reference) - 1
+    assert cost < 80.0
     assert all(
         geodesic_distance_m(
             shifted_run[i]["lat"],
@@ -216,7 +221,66 @@ def test_index_and_dtw_alignment_match_on_identical_runs():
         points=[{"lat": 0.00001, "lon": i * 0.0001} for i in range(10)],
     )
 
-    index_alignments = build_alignment_mappings(reference, [other], params_index)
-    dtw_alignments = build_alignment_mappings(reference, [other], params_dtw)
+    index_alignments, _ = build_alignment_mappings(reference, [other], params_index)
+    dtw_alignments, _ = build_alignment_mappings(reference, [other], params_dtw)
 
     assert index_alignments[other.link_id] == dtw_alignments[other.link_id]
+
+
+def test_alignment_cost_used_for_filtering():
+    reference = Run(
+        link_id=1,
+        points=[{"lat": 0.0, "lon": i * 0.0001} for i in range(10)],
+    )
+    good_run = Run(
+        link_id=2,
+        points=[{"lat": 0.00002, "lon": i * 0.0001} for i in range(10)],
+    )
+    bad_run = Run(
+        link_id=3,
+        points=[{"lat": 0.001, "lon": i * 0.0001} for i in range(10)],
+    )
+
+    params = MultirunParams(
+        align_method="dtw",
+        max_alignment_cost=30.0,
+        quality_min=0.0,
+        use_quality_filter=True,
+    )
+
+    runs = [reference, good_run, bad_run]
+    stats = build_run_quality_stats(runs)
+    length_med = median([s.length_m for s in stats])
+    for s in stats:
+        compute_run_quality(s, length_med, params)
+
+    ref_stats = select_reference_run(stats, params)
+    ref_run = next(r for r in runs if r.link_id == ref_stats.run_id)
+    normalized = [
+        Run(
+            link_id=r.link_id,
+            points=(normalize_direction(ref_run.points, r.points) if r.link_id != ref_run.link_id else r.points),
+            metadata=r.metadata,
+        )
+        for r in runs
+    ]
+    others = [r for r in normalized if r.link_id != ref_run.link_id]
+    alignments, alignment_costs = build_alignment_mappings(ref_run, others, params)
+    alignment_costs[ref_run.link_id] = None
+
+    kept, removed = compute_and_filter_runs_by_quality(
+        stats,
+        params,
+        alignment_costs=alignment_costs,
+        alignment_mappings=alignments,
+        reference_run_id=ref_run.link_id,
+    )
+
+    kept_ids = {s.run_id for s in kept}
+    removed_ids = {s.run_id for s in removed}
+
+    assert ref_run.link_id in kept_ids
+    assert good_run.link_id in kept_ids
+    assert bad_run.link_id in removed_ids
+    aligned_stats = [s for s in kept if s.run_id != ref_run.link_id]
+    assert all(s.alignment_cost is not None for s in aligned_stats)

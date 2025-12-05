@@ -39,6 +39,7 @@ class MultirunParams(BaseModel):
     use_quality_filter: bool = True
     quality_min: float = 0.3
     outlier_sigma: float = 2.0
+    max_alignment_cost: Optional[float] = None
     reference_method: Literal["best_quality", "medoid"] = "best_quality"
     align_method: Literal["index", "dtw"] = "index"
 
@@ -50,6 +51,8 @@ class RunQualityStats:
     hmm_score: Optional[float] = None
     sensor_quality: Optional[float] = None
     quality: Optional[float] = None
+    alignment_cost: Optional[float] = None
+    alignment_indices: Optional[List[int]] = None
 
 
 def _distance_m(p1: Point, p2: Point) -> float:
@@ -158,9 +161,15 @@ def _clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> floa
 
 
 def compute_run_quality(
-    stats: RunQualityStats, length_median: Optional[float], params: MultirunParams
+    stats: RunQualityStats,
+    length_median: Optional[float],
+    params: MultirunParams,
+    alignment_cost: Optional[float] = None,
 ) -> float:
     """Compute a normalized [0, 1] quality score for a single run."""
+
+    if alignment_cost is not None:
+        stats.alignment_cost = alignment_cost
 
     hmm_score_norm = (
         _clamp(float(stats.hmm_score)) if stats.hmm_score is not None else 0.5
@@ -177,11 +186,20 @@ def compute_run_quality(
         _clamp(float(stats.sensor_quality)) if stats.sensor_quality is not None else 0.5
     )
 
+    if stats.alignment_cost is None:
+        alignment_score = 1.0
+    else:
+        normalized = stats.alignment_cost / (1.0 + stats.alignment_cost)
+        alignment_score = _clamp(1.0 - normalized)
+
     w_hmm = 0.6
     w_len = 0.3
     w_sensor = 0.1
 
-    quality = w_hmm * hmm_score_norm + w_len * length_consistency + w_sensor * sensor_quality_norm
+    base_quality = (
+        w_hmm * hmm_score_norm + w_len * length_consistency + w_sensor * sensor_quality_norm
+    )
+    quality = base_quality * alignment_score
     stats.quality = _clamp(quality)
     return stats.quality
 
@@ -224,6 +242,9 @@ def compute_and_filter_runs_by_quality(
     stats_list: List[RunQualityStats],
     params: MultirunParams,
     logger: Optional[logging.Logger] = None,
+    alignment_costs: Optional[dict[int, float]] = None,
+    alignment_mappings: Optional[dict[int, List[int]]] = None,
+    reference_run_id: Optional[int] = None,
 ) -> Tuple[List[RunQualityStats], List[RunQualityStats]]:
     if not stats_list:
         return [], []
@@ -231,8 +252,14 @@ def compute_and_filter_runs_by_quality(
     length_median = median([s.length_m for s in stats_list if s.length_m is not None])
 
     for stats in stats_list:
-        if stats.quality is None:
-            compute_run_quality(stats, length_median, params)
+        if alignment_mappings and stats.run_id in alignment_mappings:
+            stats.alignment_indices = alignment_mappings.get(stats.run_id)
+        if alignment_costs and stats.run_id in alignment_costs:
+            stats.alignment_cost = alignment_costs.get(stats.run_id)
+        if stats.quality is None or alignment_costs is not None:
+            compute_run_quality(
+                stats, length_median, params, alignment_cost=stats.alignment_cost
+            )
 
     if not params.use_quality_filter:
         return stats_list, []
@@ -248,7 +275,13 @@ def compute_and_filter_runs_by_quality(
         quality = stats.quality if stats.quality is not None else 0.0
         is_low = quality < params.quality_min
         is_outlier = quality < mean_q - params.outlier_sigma * std_q
-        if is_low or is_outlier:
+        over_alignment_cost = (
+            params.max_alignment_cost is not None
+            and stats.alignment_cost is not None
+            and stats.alignment_cost > params.max_alignment_cost
+            and stats.run_id != reference_run_id
+        )
+        if is_low or is_outlier or over_alignment_cost:
             removed.append(stats)
         else:
             kept.append(stats)
@@ -504,7 +537,7 @@ def dtw_align_run_to_reference(
     ref_points: Sequence[Point],
     run_points: Sequence[Point],
     max_warp: Optional[int] = None,
-) -> List[int]:
+) -> Tuple[List[int], float]:
     """
     Align a run to the reference run using Dynamic Time Warping.
 
@@ -512,7 +545,7 @@ def dtw_align_run_to_reference(
     """
 
     if not ref_points or not run_points:
-        return []
+        return [], math.inf
 
     n = len(ref_points)
     m = len(run_points)
@@ -549,7 +582,7 @@ def dtw_align_run_to_reference(
             parent[i][j] = prev_idx
 
     if dp[-1][-1] == math.inf:
-        return []
+        return [], math.inf
 
     path: List[Tuple[int, int]] = []
     i, j = n - 1, m - 1
@@ -581,7 +614,11 @@ def dtw_align_run_to_reference(
         aligned_indices.append(ref_idx)
         last_idx = ref_idx
 
-    return aligned_indices
+    total_cost = dp[-1][-1]
+    path_len = len(path)
+    normalized_cost = total_cost / path_len if path_len > 0 else total_cost
+
+    return aligned_indices, normalized_cost
 
 
 def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
@@ -767,21 +804,27 @@ def fuse_aligned_runs(
 
 def build_alignment_mappings(
     ref_run: Run, other_runs: List[Run], params: MultirunParams
-) -> dict[int, List[int]]:
+) -> Tuple[dict[int, List[int]], dict[int, float]]:
     alignments: dict[int, List[int]] = {}
+    alignment_costs: dict[int, float] = {}
     ref_len = len(ref_run.points)
     for run in other_runs:
         mapping: List[int]
+        cost: float
         if params.align_method == "dtw":
-            mapping = dtw_align_run_to_reference(ref_run.points, run.points)
+            mapping, cost = dtw_align_run_to_reference(ref_run.points, run.points)
             if not mapping or len(mapping) != len(run.points):
                 mapping = [min(idx, max(ref_len - 1, 0)) for idx in range(len(run.points))]
+            if math.isinf(cost):
+                cost = math.inf
         else:
             mapping = [min(idx, max(ref_len - 1, 0)) for idx in range(len(run.points))]
+            cost = 0.0
 
         alignments[run.link_id] = mapping
+        alignment_costs[run.link_id] = cost
 
-    return alignments
+    return alignments, alignment_costs
 
 
 def smooth_polyline(points: Sequence[Point], iterations: int = 2) -> List[Point]:
@@ -984,12 +1027,53 @@ def unify_runs(
 
     runs = _drop_outlier_runs_by_endpoints(runs)
     stats_list = build_run_quality_stats(runs)
+    length_median = median([s.length_m for s in stats_list if s.length_m is not None])
+    for stats in stats_list:
+        if stats.quality is None:
+            compute_run_quality(stats, length_median, params)
+
+    reference_stats = select_reference_run(stats_list, params)
+    reference_run = next(
+        (r for r in runs if reference_stats and r.link_id == reference_stats.run_id),
+        runs[0],
+    )
+
+    normalized_for_alignment: List[Run] = []
+    for run in runs:
+        if run.link_id == reference_run.link_id:
+            normalized_for_alignment.append(run)
+            continue
+        aligned_points = normalize_direction(reference_run.points, run.points)
+        normalized_for_alignment.append(
+            Run(link_id=run.link_id, points=aligned_points, metadata=run.metadata)
+        )
+
+    other_for_alignment = [r for r in normalized_for_alignment if r.link_id != reference_run.link_id]
+    alignment_mappings, alignment_costs = build_alignment_mappings(
+        reference_run, other_for_alignment, params
+    )
+    alignment_costs[reference_run.link_id] = None
+
     kept_stats, removed_stats = compute_and_filter_runs_by_quality(
-        stats_list, params, logger=logger
+        stats_list,
+        params,
+        logger=logger,
+        alignment_costs=alignment_costs,
+        alignment_mappings=alignment_mappings,
+        reference_run_id=reference_run.link_id,
     )
 
     kept_ids = {s.run_id for s in kept_stats}
-    runs = [r for r in runs if r.link_id in kept_ids]
+    if reference_run.link_id not in kept_ids:
+        ref_stats = next(
+            (s for s in stats_list if s.run_id == reference_run.link_id), None
+        )
+        if ref_stats:
+            kept_stats.append(ref_stats)
+            kept_ids.add(ref_stats.run_id)
+            removed_stats = [s for s in removed_stats if s.run_id != ref_stats.run_id]
+
+    runs = [r for r in normalized_for_alignment if r.link_id in kept_ids]
 
     lengths = [_polyline_length(r.points) for r in runs]
     if not lengths:
@@ -999,16 +1083,6 @@ def unify_runs(
     max_len = max(lengths)
     if max_len == 0 or (max_len - min_len) / max_len > 0.4:
         raise ValueError("Length difference between runs is too large")
-
-    reference_stats = None
-    if params.use_quality_filter:
-        reference_stats = select_reference_run(kept_stats, params)
-    else:
-        reference_stats = next((s for s in stats_list if s.run_id == runs[0].link_id), None)
-    reference_run = next(
-        (r for r in runs if reference_stats and r.link_id == reference_stats.run_id),
-        runs[0],
-    )
 
     reference_points = reference_run.points
     normalized_runs: List[Run] = [reference_run]
@@ -1050,7 +1124,7 @@ def unify_runs(
     )
     other_resampled = [r for r in resampled_runs if r.link_id != ref_resampled.link_id]
 
-    alignments = build_alignment_mappings(ref_resampled, other_resampled, params)
+    alignments, _ = build_alignment_mappings(ref_resampled, other_resampled, params)
     if logger:
         logger.debug(
             "Built %d alignment mappings using %s method",
