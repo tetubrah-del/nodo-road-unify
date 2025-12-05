@@ -43,6 +43,11 @@ class MultirunParams(BaseModel):
     max_length_ratio_from_median: Optional[float] = None
     min_quality_score: Optional[float] = None
     min_coverage_ratio: Optional[float] = None
+    # v7: auto reference & weighted DTW options
+    use_auto_reference: bool = True
+    use_weighted_dtw: bool = True
+    # How strongly quality weights affect DTW cost (0=no effect, 1=full)
+    dtw_weight_alpha: float = 0.5
     reference_method: Literal["best_quality", "medoid"] = "best_quality"
     align_method: Literal["index", "dtw"] = "index"
     fusion_method: Literal["mean", "median", "huber", "tukey"] = "mean"
@@ -352,17 +357,77 @@ def compute_and_filter_runs_by_quality(
     return kept, removed
 
 
+def _reference_quality_score(stats: RunQualityStats) -> float:
+    """Compute a lightweight [0, 1] quality score for reference selection and weights."""
+
+    alignment_score: float
+    if stats.alignment_cost is None:
+        alignment_score = 1.0
+    else:
+        normalized = stats.alignment_cost / (1.0 + stats.alignment_cost)
+        alignment_score = _clamp(1.0 - normalized)
+
+    length_ratio = stats.length_ratio if stats.length_ratio is not None else 1.0
+    length_score = 1.0 - min(1.0, abs(length_ratio - 1.0))
+
+    coverage_score = stats.coverage_ratio if stats.coverage_ratio is not None else 0.0
+
+    quality_score = (
+        0.5 * alignment_score
+        + 0.3 * length_score
+        + 0.2 * _clamp(coverage_score)
+    )
+
+    return _clamp(quality_score)
+
+
 def select_reference_run(
     stats_list: List[RunQualityStats], params: MultirunParams
-) -> Optional[RunQualityStats]:
+) -> Optional[int]:
+    """Select the reference run id based on quality stats and configuration."""
+
     if not stats_list:
         return None
 
-    if params.reference_method == "best_quality":
-        return max(stats_list, key=lambda s: s.quality if s.quality is not None else -math.inf)
+    if not params.use_auto_reference:
+        if params.reference_method == "best_quality":
+            best = max(
+                stats_list,
+                key=lambda s: s.quality if s.quality is not None else -math.inf,
+            )
+            return best.run_id
+        best = max(
+            stats_list,
+            key=lambda s: s.quality if s.quality is not None else -math.inf,
+        )
+        return best.run_id
 
-    # Fallback to best quality for unimplemented methods
-    return max(stats_list, key=lambda s: s.quality if s.quality is not None else -math.inf)
+    scored = {stats.run_id: _reference_quality_score(stats) for stats in stats_list}
+    if not scored:
+        fallback = max(
+            stats_list,
+            key=lambda s: s.quality if s.quality is not None else -math.inf,
+        )
+        return fallback.run_id
+
+    return max(scored.items(), key=lambda item: item[1])[0]
+
+
+def compute_run_weight(
+    stats: RunQualityStats, params: MultirunParams, max_quality_score: Optional[float] = None
+) -> float:
+    """
+    Compute a scalar weight (0–1) for a run based on its quality stats.
+
+    Uses the reference quality score and normalizes it so that the best run
+    receives weight 1.0 and the worst still contributes slightly.
+    """
+
+    raw_score = _reference_quality_score(stats)
+    max_raw = max_quality_score if max_quality_score and max_quality_score > 0 else 1.0
+    min_w = 0.1
+    weight = min_w + (raw_score / max_raw) * (1.0 - min_w)
+    return _clamp(weight)
 
 
 def normalize_direction(reference_points: Sequence[Point], candidate_points: Sequence[Point]) -> List[Point]:
@@ -584,6 +649,8 @@ def _signed_offset(point: Point, centerline: Sequence[Point], idx: int) -> float
 def dtw_align_run_to_reference(
     ref_points: Sequence[Point],
     run_points: Sequence[Point],
+    params: MultirunParams,
+    run_weight: Optional[float] = None,
     max_warp: Optional[int] = None,
 ) -> Tuple[List[int], float]:
     """
@@ -610,7 +677,13 @@ def dtw_align_run_to_reference(
             if not in_band(i, j):
                 continue
 
-            cost = _distance_m(ref_points[i], run_points[j])
+            base_cost = _distance_m(ref_points[i], run_points[j])
+
+            if run_weight is not None and params.use_weighted_dtw:
+                quality_factor = 1.0 + params.dtw_weight_alpha * (1.0 - run_weight)
+                cost = base_cost * quality_factor
+            else:
+                cost = base_cost
 
             candidates: List[Tuple[float, Optional[Tuple[int, int]]]] = []
             if i > 0 and dp[i - 1][j] != math.inf:
@@ -948,7 +1021,10 @@ def fuse_aligned_runs(
 
 
 def build_alignment_mappings(
-    ref_run: Run, other_runs: List[Run], params: MultirunParams
+    ref_run: Run,
+    other_runs: List[Run],
+    params: MultirunParams,
+    run_weights: Optional[dict[int, float]] = None,
 ) -> Tuple[dict[int, List[int]], dict[int, float]]:
     alignments: dict[int, List[int]] = {}
     alignment_costs: dict[int, float] = {}
@@ -957,7 +1033,10 @@ def build_alignment_mappings(
         mapping: List[int]
         cost: float
         if params.align_method == "dtw":
-            mapping, cost = dtw_align_run_to_reference(ref_run.points, run.points)
+            run_weight = None if run_weights is None else run_weights.get(run.link_id)
+            mapping, cost = dtw_align_run_to_reference(
+                ref_run.points, run.points, params, run_weight=run_weight
+            )
             if not mapping or len(mapping) != len(run.points):
                 mapping = [min(idx, max(ref_len - 1, 0)) for idx in range(len(run.points))]
             if math.isinf(cost):
@@ -1005,6 +1084,7 @@ def write_unified_to_db(
     removed_runs: Optional[List[dict]] = None,
     fusion: Optional[dict] = None,
     multirun_summary: Optional[dict] = None,
+    multirun: Optional[dict] = None,
 ) -> int:
     coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
     wkt = f"LINESTRING({coords})"
@@ -1028,6 +1108,8 @@ def write_unified_to_db(
         metadata["fusion"] = fusion
     if multirun_summary:
         metadata["multirun_summary"] = multirun_summary
+    if multirun:
+        metadata["multirun"] = multirun
 
     with conn.cursor() as cur:
         cur.execute(
@@ -1177,15 +1259,16 @@ def unify_runs(
         raise ValueError("Not enough runs found for the provided link_ids")
 
     runs = _drop_outlier_runs_by_endpoints(runs)
+    base_runs = list(runs)
     stats_list = build_run_quality_stats(runs)
     length_median = median([s.length_m for s in stats_list if s.length_m is not None])
     for stats in stats_list:
         if stats.quality is None:
             compute_run_quality(stats, length_median, params)
 
-    reference_stats = select_reference_run(stats_list, params)
+    selected_reference_id = select_reference_run(stats_list, params)
     reference_run = next(
-        (r for r in runs if reference_stats and r.link_id == reference_stats.run_id),
+        (r for r in runs if selected_reference_id is not None and r.link_id == selected_reference_id),
         runs[0],
     )
 
@@ -1215,16 +1298,49 @@ def unify_runs(
     )
 
     kept_ids = {s.run_id for s in kept_stats}
-    if reference_run.link_id not in kept_ids:
-        ref_stats = next(
-            (s for s in stats_list if s.run_id == reference_run.link_id), None
-        )
+    final_reference_id = (
+        select_reference_run(kept_stats, params)
+        if params.use_auto_reference and kept_stats
+        else reference_run.link_id
+    )
+    if final_reference_id is None:
+        final_reference_id = reference_run.link_id
+
+    if final_reference_id not in kept_ids:
+        ref_stats = next((s for s in stats_list if s.run_id == final_reference_id), None)
         if ref_stats:
             kept_stats.append(ref_stats)
-            kept_ids.add(ref_stats.run_id)
-            removed_stats = [s for s in removed_stats if s.run_id != ref_stats.run_id]
+        kept_ids.add(final_reference_id)
+        removed_stats = [s for s in removed_stats if s.run_id != final_reference_id]
 
-    runs = [r for r in normalized_for_alignment if r.link_id in kept_ids]
+    reference_run = next(
+        (r for r in base_runs if r.link_id == final_reference_id), reference_run
+    )
+
+    runs: List[Run] = []
+    for run in base_runs:
+        if run.link_id not in kept_ids:
+            continue
+        if run.link_id == reference_run.link_id:
+            runs.append(run)
+            continue
+        aligned_points = normalize_direction(reference_run.points, run.points)
+        runs.append(Run(link_id=run.link_id, points=aligned_points, metadata=run.metadata))
+
+    run_stats_map = {s.run_id: s for s in kept_stats}
+    quality_scores = {
+        run_id: _reference_quality_score(stats)
+        for run_id, stats in run_stats_map.items()
+    }
+    if reference_run.link_id not in quality_scores:
+        quality_scores[reference_run.link_id] = 1.0
+    max_quality_score = max(quality_scores.values()) if quality_scores else 1.0
+    run_quality_weights = {
+        run_id: compute_run_weight(stats, params, max_quality_score)
+        for run_id, stats in run_stats_map.items()
+    }
+    if reference_run.link_id not in run_quality_weights:
+        run_quality_weights[reference_run.link_id] = 1.0
 
     lengths = [_polyline_length(r.points) for r in runs]
     if not lengths:
@@ -1258,8 +1374,16 @@ def unify_runs(
         for r in normalized_runs
     ]
 
-    weights = [_run_weight(r) for r in clipped]
-    weight_map = {run.link_id: weight for run, weight in zip(clipped, weights)}
+    base_weights = {run.link_id: _run_weight(run) for run in clipped}
+    weight_map = (
+        {
+            run_id: base_weights.get(run_id, 1.0)
+            * run_quality_weights.get(run_id, 1.0)
+            for run_id in base_weights
+        }
+        if params.use_weighted_dtw
+        else base_weights
+    )
 
     resampled_runs = [
         Run(
@@ -1276,7 +1400,10 @@ def unify_runs(
     other_resampled = [r for r in resampled_runs if r.link_id != ref_resampled.link_id]
 
     alignments, resampled_alignment_costs = build_alignment_mappings(
-        ref_resampled, other_resampled, params
+        ref_resampled,
+        other_resampled,
+        params,
+        run_weights=run_quality_weights if params.use_weighted_dtw else None,
     )
     if logger:
         logger.debug(
@@ -1356,6 +1483,12 @@ def unify_runs(
         if match_ratio is not None:
             multirun_summary["hmm_match_ratio_mean"] = match_ratio
 
+    multirun_details = {
+        "reference_run_id": reference_run.link_id,
+        "reference_selection": {"scores": quality_scores},
+        "run_weights": run_quality_weights,
+    }
+
     new_link_id = write_unified_to_db(
         conn,
         smoothed,
@@ -1374,5 +1507,6 @@ def unify_runs(
         ],
         fusion=fusion_info,
         multirun_summary=multirun_summary,
+        multirun=multirun_details,
     )
     return {"unified_link_id": new_link_id, "hmm": hmm_summary}

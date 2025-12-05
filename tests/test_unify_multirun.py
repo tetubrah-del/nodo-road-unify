@@ -11,8 +11,10 @@ from unify_multirun import (
     build_alignment_mappings,
     compute_and_filter_runs_by_quality,
     compute_run_quality,
+    compute_run_weight,
     dtw_align_run_to_reference,
     fuse_resampled,
+    fuse_aligned_runs,
     map_match_runs_with_hmm,
     normalize_direction,
     resample_polyline,
@@ -182,7 +184,7 @@ def test_filtering_removes_low_quality_runs():
 
 
 def test_reference_run_selects_best_quality():
-    params = MultirunParams(reference_method="best_quality")
+    params = MultirunParams(reference_method="best_quality", use_auto_reference=False)
     stats = [
         RunQualityStats(run_id=1, length_m=100.0, hmm_score=0.5, quality=0.5),
         RunQualityStats(run_id=2, length_m=100.0, hmm_score=0.9, quality=0.9),
@@ -190,8 +192,43 @@ def test_reference_run_selects_best_quality():
 
     ref = select_reference_run(stats, params)
 
-    assert ref is not None
-    assert ref.run_id == 2
+    assert ref == 2
+
+
+def test_select_reference_run_picks_best_quality():
+    params = MultirunParams()
+    stats = [
+        RunQualityStats(run_id=1, length_m=100.0, alignment_cost=0.2, length_ratio=0.95, coverage_ratio=0.8),
+        RunQualityStats(run_id=2, length_m=100.0, alignment_cost=0.05, length_ratio=1.02, coverage_ratio=0.9),
+        RunQualityStats(run_id=3, length_m=100.0, alignment_cost=0.8, length_ratio=1.1, coverage_ratio=0.3),
+    ]
+
+    ref_id = select_reference_run(stats, params)
+
+    assert ref_id == 2
+
+
+def test_compute_run_weight_normalization():
+    params = MultirunParams()
+    stats = [
+        RunQualityStats(run_id=1, length_m=100.0, alignment_cost=0.1, length_ratio=1.0, coverage_ratio=0.9),
+        RunQualityStats(run_id=2, length_m=100.0, alignment_cost=0.5, length_ratio=0.9, coverage_ratio=0.6),
+        RunQualityStats(run_id=3, length_m=100.0, alignment_cost=0.9, length_ratio=1.1, coverage_ratio=0.2),
+    ]
+
+    # Mirror the scoring used inside compute_run_weight for normalization
+    def quality_score(s: RunQualityStats) -> float:
+        alignment_score = 1.0 - (s.alignment_cost / (1.0 + s.alignment_cost))
+        length_score = 1.0 - min(1.0, abs((s.length_ratio or 1.0) - 1.0))
+        coverage_score = s.coverage_ratio or 0.0
+        return max(0.0, min(1.0, 0.5 * alignment_score + 0.3 * length_score + 0.2 * coverage_score))
+
+    raw_scores = [quality_score(s) for s in stats]
+    max_raw = max(raw_scores)
+    weights = [compute_run_weight(s, params, max_raw) for s in stats]
+
+    assert all(0.1 <= w <= 1.0 for w in weights)
+    assert weights[0] == max(weights)
 
 
 def test_dtw_alignment_straight_line_monotonic_and_close():
@@ -202,7 +239,8 @@ def test_dtw_alignment_straight_line_monotonic_and_close():
         {"lat": 0.00001, "lon": i * 0.000025} for i in range(40)
     ]
 
-    mapping, cost = dtw_align_run_to_reference(ref_points, run_points)
+    params = MultirunParams(align_method="dtw")
+    mapping, cost = dtw_align_run_to_reference(ref_points, run_points, params)
 
     assert len(mapping) == len(run_points)
     assert mapping == sorted(mapping)
@@ -227,7 +265,8 @@ def test_dtw_alignment_handles_shifted_curve():
         {"lat": 0.00155, "lon": 0.00018},
     ]
 
-    mapping, cost = dtw_align_run_to_reference(reference, shifted_run)
+    params = MultirunParams(align_method="dtw")
+    mapping, cost = dtw_align_run_to_reference(reference, shifted_run, params)
 
     assert mapping == sorted(mapping)
     assert len(mapping) == len(shifted_run)
@@ -243,6 +282,67 @@ def test_dtw_alignment_handles_shifted_curve():
         < 70.0
         for i in range(len(shifted_run))
     )
+
+
+def test_weighted_dtw_reduces_influence_of_bad_run():
+    reference = Run(
+        link_id=1,
+        points=[{"lat": 0.0, "lon": i * 0.0001} for i in range(5)],
+    )
+    good_run = Run(
+        link_id=2,
+        points=[{"lat": 0.00001, "lon": i * 0.0001} for i in range(5)],
+    )
+    bad_run = Run(
+        link_id=3,
+        points=[{"lat": 0.0005, "lon": i * 0.0001} for i in range(5)],
+    )
+
+    params_unweighted = MultirunParams(align_method="dtw", use_weighted_dtw=False)
+    params_weighted = MultirunParams(align_method="dtw", use_weighted_dtw=True, dtw_weight_alpha=0.8)
+
+    stats = [
+        RunQualityStats(run_id=reference.link_id, length_m=1.0, alignment_cost=0.0, length_ratio=1.0, coverage_ratio=1.0),
+        RunQualityStats(run_id=good_run.link_id, length_m=1.0, alignment_cost=0.05, length_ratio=1.0, coverage_ratio=0.9),
+        RunQualityStats(run_id=bad_run.link_id, length_m=1.0, alignment_cost=0.9, length_ratio=1.0, coverage_ratio=0.5),
+    ]
+
+    def quality_score(s: RunQualityStats) -> float:
+        alignment_score = 1.0 - (s.alignment_cost / (1.0 + s.alignment_cost))
+        length_score = 1.0 - min(1.0, abs((s.length_ratio or 1.0) - 1.0))
+        coverage_score = s.coverage_ratio or 0.0
+        return max(0.0, min(1.0, 0.5 * alignment_score + 0.3 * length_score + 0.2 * coverage_score))
+
+    max_quality = max(quality_score(s) for s in stats)
+    run_weights = {s.run_id: compute_run_weight(s, params_weighted, max_quality) for s in stats}
+
+    ref_resampled = reference
+    others = [good_run, bad_run]
+
+    align_unweighted, _ = build_alignment_mappings(ref_resampled, others, params_unweighted)
+    fused_unweighted = fuse_aligned_runs(
+        ref_resampled,
+        others,
+        align_unweighted,
+        weights={r.link_id: 1.0 for r in [reference, good_run, bad_run]},
+    )
+
+    align_weighted, _ = build_alignment_mappings(
+        ref_resampled, others, params_weighted, run_weights=run_weights
+    )
+    fused_weighted = fuse_aligned_runs(
+        ref_resampled,
+        others,
+        align_weighted,
+        weights={
+            reference.link_id: 1.0,
+            good_run.link_id: run_weights[good_run.link_id],
+            bad_run.link_id: run_weights[bad_run.link_id],
+        },
+    )
+
+    assert fused_weighted[0]["lat"] < fused_unweighted[0]["lat"]
+    assert fused_weighted[-1]["lat"] < fused_unweighted[-1]["lat"]
 
 
 def test_index_and_dtw_alignment_match_on_identical_runs():
@@ -290,8 +390,8 @@ def test_alignment_cost_used_for_filtering():
     for s in stats:
         compute_run_quality(s, length_med, params)
 
-    ref_stats = select_reference_run(stats, params)
-    ref_run = next(r for r in runs if r.link_id == ref_stats.run_id)
+    ref_run_id = select_reference_run(stats, params)
+    ref_run = next(r for r in runs if r.link_id == ref_run_id)
     normalized = [
         Run(
             link_id=r.link_id,
@@ -367,8 +467,8 @@ def test_outlier_filter_combines_multiple_metrics():
             s.hmm_score = 0.8
         compute_run_quality(s, length_med, params)
 
-    ref_stats = select_reference_run(stats, params)
-    ref_run = next(r for r in runs if r.link_id == ref_stats.run_id)
+    ref_run_id = select_reference_run(stats, params)
+    ref_run = next(r for r in runs if r.link_id == ref_run_id)
     normalized = [
         Run(
             link_id=r.link_id,
