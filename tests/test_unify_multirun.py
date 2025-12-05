@@ -1,10 +1,14 @@
 import pytest
 
+from geodesic_utils import geodesic_distance_m
 from unify_multirun import (
     MultirunParams,
+    Run,
     RunQualityStats,
+    build_alignment_mappings,
     compute_and_filter_runs_by_quality,
     compute_run_quality,
+    dtw_align_run_to_reference,
     fuse_resampled,
     map_match_runs_with_hmm,
     normalize_direction,
@@ -149,3 +153,70 @@ def test_reference_run_selects_best_quality():
 
     assert ref is not None
     assert ref.run_id == 2
+
+
+def test_dtw_alignment_straight_line_monotonic_and_close():
+    ref_points = [
+        {"lat": 0.0, "lon": i * 0.00005} for i in range(20)
+    ]
+    run_points = [
+        {"lat": 0.00001, "lon": i * 0.000025} for i in range(40)
+    ]
+
+    mapping = dtw_align_run_to_reference(ref_points, run_points)
+
+    assert len(mapping) == len(run_points)
+    assert mapping == sorted(mapping)
+    assert all(
+        geodesic_distance_m(run_points[i]["lat"], run_points[i]["lon"], ref_points[mapping[i]]["lat"], ref_points[mapping[i]]["lon"]) < 5.0
+        for i in range(len(run_points))
+    )
+
+
+def test_dtw_alignment_handles_shifted_curve():
+    reference = [
+        {"lat": 0.0, "lon": 0.0},
+        {"lat": 0.0005, "lon": 0.0002},
+        {"lat": 0.001, "lon": -0.0002},
+        {"lat": 0.0015, "lon": 0.0002},
+        {"lat": 0.002, "lon": 0.0},
+    ]
+    shifted_run = [
+        {"lat": 0.00055, "lon": 0.00022},
+        {"lat": 0.00105, "lon": -0.00018},
+        {"lat": 0.00155, "lon": 0.00018},
+    ]
+
+    mapping = dtw_align_run_to_reference(reference, shifted_run)
+
+    assert mapping == sorted(mapping)
+    assert len(mapping) == len(shifted_run)
+    assert max(mapping) <= len(reference) - 1
+    assert all(
+        geodesic_distance_m(
+            shifted_run[i]["lat"],
+            shifted_run[i]["lon"],
+            reference[mapping[i]]["lat"],
+            reference[mapping[i]]["lon"],
+        )
+        < 70.0
+        for i in range(len(shifted_run))
+    )
+
+
+def test_index_and_dtw_alignment_match_on_identical_runs():
+    params_index = MultirunParams(align_method="index")
+    params_dtw = MultirunParams(align_method="dtw")
+    reference = Run(
+        link_id=1,
+        points=[{"lat": 0.0, "lon": i * 0.0001} for i in range(10)],
+    )
+    other = Run(
+        link_id=2,
+        points=[{"lat": 0.00001, "lon": i * 0.0001} for i in range(10)],
+    )
+
+    index_alignments = build_alignment_mappings(reference, [other], params_index)
+    dtw_alignments = build_alignment_mappings(reference, [other], params_dtw)
+
+    assert index_alignments[other.link_id] == dtw_alignments[other.link_id]

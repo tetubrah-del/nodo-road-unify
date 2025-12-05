@@ -40,6 +40,7 @@ class MultirunParams(BaseModel):
     quality_min: float = 0.3
     outlier_sigma: float = 2.0
     reference_method: Literal["best_quality", "medoid"] = "best_quality"
+    align_method: Literal["index", "dtw"] = "index"
 
 
 @dataclass
@@ -499,6 +500,90 @@ def _signed_offset(point: Point, centerline: Sequence[Point], idx: int) -> float
     return distance * math.sin(angle_diff)
 
 
+def dtw_align_run_to_reference(
+    ref_points: Sequence[Point],
+    run_points: Sequence[Point],
+    max_warp: Optional[int] = None,
+) -> List[int]:
+    """
+    Align a run to the reference run using Dynamic Time Warping.
+
+    Returns a list of reference indices, one for each point in ``run_points``.
+    """
+
+    if not ref_points or not run_points:
+        return []
+
+    n = len(ref_points)
+    m = len(run_points)
+    dp = [[math.inf for _ in range(m)] for _ in range(n)]
+    parent: List[List[Optional[Tuple[int, int]]]] = [
+        [None for _ in range(m)] for _ in range(n)
+    ]
+
+    def in_band(i: int, j: int) -> bool:
+        return max_warp is None or abs(i - j) <= max_warp
+
+    for i in range(n):
+        for j in range(m):
+            if not in_band(i, j):
+                continue
+
+            cost = _distance_m(ref_points[i], run_points[j])
+
+            candidates: List[Tuple[float, Optional[Tuple[int, int]]]] = []
+            if i > 0 and dp[i - 1][j] != math.inf:
+                candidates.append((dp[i - 1][j], (i - 1, j)))
+            if j > 0 and dp[i][j - 1] != math.inf:
+                candidates.append((dp[i][j - 1], (i, j - 1)))
+            if i > 0 and j > 0 and dp[i - 1][j - 1] != math.inf:
+                candidates.append((dp[i - 1][j - 1], (i - 1, j - 1)))
+
+            if not candidates:
+                if i == 0 and j == 0:
+                    dp[i][j] = cost
+                continue
+
+            prev_cost, prev_idx = min(candidates, key=lambda x: x[0])
+            dp[i][j] = cost + prev_cost
+            parent[i][j] = prev_idx
+
+    if dp[-1][-1] == math.inf:
+        return []
+
+    path: List[Tuple[int, int]] = []
+    i, j = n - 1, m - 1
+    while True:
+        path.append((i, j))
+        if i == 0 and j == 0:
+            break
+        prev = parent[i][j]
+        if prev is None:
+            break
+        i, j = prev
+
+    path.reverse()
+
+    aligned: List[List[int]] = [[] for _ in range(m)]
+    for ref_idx, run_idx in path:
+        aligned[run_idx].append(ref_idx)
+
+    aligned_indices: List[int] = []
+    last_idx = 0
+    for run_idx, ref_candidates in enumerate(aligned):
+        if ref_candidates:
+            avg = sum(ref_candidates) / len(ref_candidates)
+            ref_idx = int(round(avg))
+        else:
+            ref_idx = min(run_idx, n - 1)
+        ref_idx = max(0, min(ref_idx, n - 1))
+        ref_idx = max(last_idx, ref_idx)
+        aligned_indices.append(ref_idx)
+        last_idx = ref_idx
+
+    return aligned_indices
+
+
 def _percentile(values: Sequence[float], percentile: float) -> Optional[float]:
     if not values:
         return None
@@ -527,6 +612,38 @@ def _smooth_profile(values: Sequence[Optional[float]], window: int) -> List[Opti
             continue
         smoothed.append(sum(window_vals) / len(window_vals))
     return smoothed
+
+
+def _fuse_points(
+    points_with_weights: Sequence[Tuple[Point, float]], drop_outlier_fraction: float
+) -> Optional[Point]:
+    if not points_with_weights:
+        return None
+
+    median_point = {
+        "lat": median(p[0]["lat"] for p in points_with_weights),
+        "lon": median(p[0]["lon"] for p in points_with_weights),
+    }
+
+    distances = [
+        (_distance_m(p, median_point), p, w) for p, w in points_with_weights
+    ]
+    distances.sort(key=lambda x: x[0])
+
+    keep_count = max(1, int(len(distances) * (1 - drop_outlier_fraction)))
+    kept = distances[:keep_count]
+
+    weight_sum = sum(w for _, _, w in kept)
+    if weight_sum == 0:
+        weight_sum = len(kept)
+        return {
+            "lat": sum(p["lat"] for _, p, _ in kept) / len(kept),
+            "lon": sum(p["lon"] for _, p, _ in kept) / len(kept),
+        }
+
+    avg_lat = sum(w * p["lat"] for _, p, w in kept) / weight_sum
+    avg_lon = sum(w * p["lon"] for _, p, w in kept) / weight_sum
+    return {"lat": avg_lat, "lon": avg_lon}
 
 
 def estimate_width_profile(
@@ -603,36 +720,68 @@ def fuse_resampled(
             if idx < len(run):
                 points_at_idx.append((run[idx], weights[run_idx]))
 
-        if not points_at_idx:
-            continue
-
-        median_point = {
-            "lat": median(p[0]["lat"] for p in points_at_idx),
-            "lon": median(p[0]["lon"] for p in points_at_idx),
-        }
-
-        distances = [(_distance_m(p, median_point), p, w) for p, w in points_at_idx]
-        distances.sort(key=lambda x: x[0])
-
-        keep_count = max(1, int(len(distances) * (1 - drop_outlier_fraction)))
-        kept = distances[:keep_count]
-
-        weight_sum = sum(w for _, _, w in kept)
-        if weight_sum == 0:
-            weight_sum = len(kept)
-            fused.append(
-                {
-                    "lat": sum(p["lat"] for _, p, _ in kept) / len(kept),
-                    "lon": sum(p["lon"] for _, p, _ in kept) / len(kept),
-                }
-            )
-            continue
-
-        avg_lat = sum(w * p["lat"] for _, p, w in kept) / weight_sum
-        avg_lon = sum(w * p["lon"] for _, p, w in kept) / weight_sum
-        fused.append({"lat": avg_lat, "lon": avg_lon})
+        fused_point = _fuse_points(points_at_idx, drop_outlier_fraction)
+        if fused_point:
+            fused.append(fused_point)
 
     return fused
+
+
+def fuse_aligned_runs(
+    reference_run: Run,
+    other_runs: Sequence[Run],
+    alignments: dict[int, List[int]],
+    drop_outlier_fraction: float = 0.25,
+    weights: Optional[dict[int, float]] = None,
+) -> List[Point]:
+    if not reference_run.points:
+        return []
+
+    point_count = len(reference_run.points)
+    buckets: List[List[Tuple[Point, float]]] = [[] for _ in range(point_count)]
+
+    ref_weight = 1.0 if weights is None else weights.get(reference_run.link_id, 1.0)
+    for idx, pt in enumerate(reference_run.points):
+        buckets[idx].append((pt, ref_weight))
+
+    for run in other_runs:
+        mapping = alignments.get(run.link_id)
+        if not mapping or not run.points:
+            continue
+        run_weight = 1.0 if weights is None else weights.get(run.link_id, 1.0)
+        for run_idx, ref_idx in enumerate(mapping):
+            if run_idx >= len(run.points):
+                continue
+            if ref_idx < 0 or ref_idx >= point_count:
+                continue
+            buckets[ref_idx].append((run.points[run_idx], run_weight))
+
+    fused: List[Point] = []
+    for bucket in buckets:
+        fused_point = _fuse_points(bucket, drop_outlier_fraction)
+        if fused_point:
+            fused.append(fused_point)
+
+    return fused
+
+
+def build_alignment_mappings(
+    ref_run: Run, other_runs: List[Run], params: MultirunParams
+) -> dict[int, List[int]]:
+    alignments: dict[int, List[int]] = {}
+    ref_len = len(ref_run.points)
+    for run in other_runs:
+        mapping: List[int]
+        if params.align_method == "dtw":
+            mapping = dtw_align_run_to_reference(ref_run.points, run.points)
+            if not mapping or len(mapping) != len(run.points):
+                mapping = [min(idx, max(ref_len - 1, 0)) for idx in range(len(run.points))]
+        else:
+            mapping = [min(idx, max(ref_len - 1, 0)) for idx in range(len(run.points))]
+
+        alignments[run.link_id] = mapping
+
+    return alignments
 
 
 def smooth_polyline(points: Sequence[Point], iterations: int = 2) -> List[Point]:
@@ -887,8 +1036,34 @@ def unify_runs(
     weights = [_run_weight(r) for r in clipped]
     weight_map = {run.link_id: weight for run, weight in zip(clipped, weights)}
 
-    resampled = [resample_polyline(r.points, resample_points) for r in clipped]
-    fused = fuse_resampled(resampled, weights=weights)
+    resampled_runs = [
+        Run(
+            link_id=r.link_id,
+            points=resample_polyline(r.points, resample_points),
+            metadata=r.metadata,
+        )
+        for r in clipped
+    ]
+    ref_resampled = next(
+        (r for r in resampled_runs if r.link_id == reference_run.link_id),
+        resampled_runs[0],
+    )
+    other_resampled = [r for r in resampled_runs if r.link_id != ref_resampled.link_id]
+
+    alignments = build_alignment_mappings(ref_resampled, other_resampled, params)
+    if logger:
+        logger.debug(
+            "Built %d alignment mappings using %s method",
+            len(alignments),
+            params.align_method,
+        )
+
+    fused = fuse_aligned_runs(
+        ref_resampled,
+        other_resampled,
+        alignments,
+        weights=weight_map,
+    )
     smoothed = smooth_polyline(fused)
 
     width_profile = estimate_width_profile(smoothed, clipped) if estimate_width else None
