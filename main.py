@@ -385,14 +385,19 @@ def health():
 
 
 @app.post("/api/unify/multirun")
-def unify_multirun(payload: MultiRunUnifyRequest):
+def unify_multirun(payload: MultiRunUnifyRequest, use_hmm: bool = False, hmm_debug: bool = False):
     if len(payload.link_ids) < 2:
         raise HTTPException(status_code=400, detail="link_ids must contain at least two items")
 
     try:
         with get_connection() as conn:
-            new_link_id = unify_runs(payload.link_ids, conn=conn)
-            return {"unified_link_id": new_link_id, "status": "ok"}
+            result = unify_runs(
+                payload.link_ids, conn=conn, use_hmm=use_hmm, hmm_debug=hmm_debug
+            )
+            response = {"unified_link_id": result.get("unified_link_id"), "status": "ok"}
+            if hmm_debug:
+                response["hmm"] = result.get("hmm", {"enabled": bool(use_hmm)})
+            return response
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except HTTPException:
@@ -939,6 +944,7 @@ def map_page():
     function bindUnifiedPopup(layer, p) {
       const meta = p.metadata || {};
       const gpsStats = meta.gps_stats || {};
+      const hmm = meta.hmm || {};
 
       const html = [
         `<b>Unified link ${p.link_id}</b>`,
@@ -973,7 +979,26 @@ def map_page():
         }
       }
 
-      layer.bindPopup(html + gpsHtml);
+      let hmmHtml = '';
+      if (hmm && hmm.enabled) {
+        hmmHtml += '<hr>';
+        hmmHtml += '<b>HMM (debug)</b><br>';
+        const matchedId = hmm.matched_link_id !== null && hmm.matched_link_id !== undefined
+          ? hmm.matched_link_id
+          : '-';
+        hmmHtml += `Matched link: ${matchedId}<br>`;
+        if (typeof hmm.matched_ratio === 'number') {
+          hmmHtml += `Matched ratio: ${(hmm.matched_ratio * 100).toFixed(1)}%<br>`;
+        }
+        if (typeof hmm.avg_emission_prob === 'number') {
+          hmmHtml += `Avg emission: ${hmm.avg_emission_prob.toFixed(3)}<br>`;
+        }
+        if (typeof hmm.log_likelihood === 'number') {
+          hmmHtml += `Log likelihood: ${hmm.log_likelihood.toFixed(2)}<br>`;
+        }
+      }
+
+      layer.bindPopup(html + gpsHtml + hmmHtml);
     }
 
     function bindRawPopup(layer, p) {
@@ -1106,6 +1131,10 @@ def map_page():
           <div class="legend-item">
             <span class="legend-line" style="background:#000000"></span>
             <span>Danger: 未設定（黒）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#000000"></span>
+            <span>HMM-validated: popup に表示</span>
           </div>
         `;
         return div;
