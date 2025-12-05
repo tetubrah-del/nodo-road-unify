@@ -12,6 +12,7 @@ from psycopg2.extensions import connection as PGConnection
 from pydantic import BaseModel, Field
 
 from danger_score_utils import compute_danger_score_v2
+import unify_multirun
 from unify_multirun import unify_runs
 
 # Run: uvicorn main:app --reload
@@ -110,6 +111,16 @@ class CollectorRequest(BaseModel):
 
 class MultiRunUnifyRequest(BaseModel):
     link_ids: List[int]
+
+
+class MultirunParams(BaseModel):
+    use_hmm: bool = False
+    hmm_debug: bool = False
+
+    use_quality_filter: bool = True
+    quality_min: float = 0.3
+    outlier_sigma: float = 2.0
+    reference_method: Literal["best_quality", "medoid"] = "best_quality"
 
 
 def _point_distance_m(p1: GpsPoint, p2: GpsPoint) -> float:
@@ -385,14 +396,31 @@ def health():
 
 
 @app.post("/api/unify/multirun")
-def unify_multirun(payload: MultiRunUnifyRequest, use_hmm: bool = False, hmm_debug: bool = False):
+def unify_multirun(
+    payload: MultiRunUnifyRequest,
+    use_hmm: bool = False,
+    hmm_debug: bool = False,
+    use_quality_filter: bool = True,
+    quality_min: float = 0.3,
+    outlier_sigma: float = 2.0,
+    reference_method: Literal["best_quality", "medoid"] = "best_quality",
+):
     if len(payload.link_ids) < 2:
         raise HTTPException(status_code=400, detail="link_ids must contain at least two items")
 
     try:
         with get_connection() as conn:
+            params = unify_multirun.MultirunParams(
+                use_hmm=use_hmm,
+                hmm_debug=hmm_debug,
+                use_quality_filter=use_quality_filter,
+                quality_min=quality_min,
+                outlier_sigma=outlier_sigma,
+                reference_method=reference_method,
+            )
+
             result = unify_runs(
-                payload.link_ids, conn=conn, use_hmm=use_hmm, hmm_debug=hmm_debug
+                payload.link_ids, conn=conn, params=params
             )
             response = {"unified_link_id": result.get("unified_link_id"), "status": "ok"}
             if hmm_debug:

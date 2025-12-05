@@ -1,10 +1,15 @@
 import pytest
 
 from unify_multirun import (
+    MultirunParams,
+    RunQualityStats,
+    compute_and_filter_runs_by_quality,
+    compute_run_quality,
     fuse_resampled,
     map_match_runs_with_hmm,
     normalize_direction,
     resample_polyline,
+    select_reference_run,
     smooth_polyline,
 )
 
@@ -105,3 +110,42 @@ def test_map_match_runs_with_hmm_returns_none_when_far():
     )
 
     assert summary["matched_link_id"] is None
+
+
+def test_compute_run_quality_prefers_better_run():
+    params = MultirunParams(use_quality_filter=False)
+    good = RunQualityStats(run_id=1, length_m=100.0, hmm_score=0.9)
+    bad = RunQualityStats(run_id=2, length_m=50.0, hmm_score=0.2)
+
+    median_len = 75.0
+    good_q = compute_run_quality(good, median_len, params)
+    bad_q = compute_run_quality(bad, median_len, params)
+
+    assert good_q > bad_q
+
+
+def test_filtering_removes_low_quality_runs():
+    params = MultirunParams(quality_min=0.3, outlier_sigma=2.0, use_quality_filter=True)
+    stats = [
+        RunQualityStats(run_id=1, length_m=100.0, hmm_score=0.9, quality=0.9),
+        RunQualityStats(run_id=2, length_m=100.0, hmm_score=0.85, quality=0.8),
+        RunQualityStats(run_id=3, length_m=100.0, hmm_score=0.01, quality=0.01),
+    ]
+
+    kept, removed = compute_and_filter_runs_by_quality(stats, params)
+
+    assert any(s.run_id == 3 for s in removed)
+    assert all(s.run_id in {1, 2} for s in kept)
+
+
+def test_reference_run_selects_best_quality():
+    params = MultirunParams(reference_method="best_quality")
+    stats = [
+        RunQualityStats(run_id=1, length_m=100.0, hmm_score=0.5, quality=0.5),
+        RunQualityStats(run_id=2, length_m=100.0, hmm_score=0.9, quality=0.9),
+    ]
+
+    ref = select_reference_run(stats, params)
+
+    assert ref is not None
+    assert ref.run_id == 2
