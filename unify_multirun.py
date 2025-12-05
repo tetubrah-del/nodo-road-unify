@@ -1,8 +1,9 @@
 import json
+import logging
 import math
 from dataclasses import dataclass
-from statistics import median
-from typing import Iterable, List, Optional, Sequence, Tuple
+from statistics import mean, median, pstdev
+from typing import Iterable, List, Literal, Optional, Sequence, Tuple
 
 from psycopg2.extras import RealDictCursor
 from psycopg2.extensions import connection as PGConnection
@@ -16,6 +17,7 @@ from geodesic_utils import (
     polyline_length,
     resample_polyline,
 )
+from pydantic import BaseModel
 from hmm_map_matching import emission_probability, hmm_viterbi, transition_probability
 
 
@@ -28,6 +30,25 @@ class Run:
     link_id: int
     points: List[Point]
     metadata: Optional[dict] = None
+
+
+class MultirunParams(BaseModel):
+    use_hmm: bool = False
+    hmm_debug: bool = False
+
+    use_quality_filter: bool = True
+    quality_min: float = 0.3
+    outlier_sigma: float = 2.0
+    reference_method: Literal["best_quality", "medoid"] = "best_quality"
+
+
+@dataclass
+class RunQualityStats:
+    run_id: int
+    length_m: float
+    hmm_score: Optional[float] = None
+    sensor_quality: Optional[float] = None
+    quality: Optional[float] = None
 
 
 def _distance_m(p1: Point, p2: Point) -> float:
@@ -129,6 +150,137 @@ def _run_weight(run: Run) -> float:
     w_sensor = _sensor_weight(run.metadata)
 
     return w_base * w_gps * w_speed * w_sensor
+
+
+def _clamp(value: float, min_value: float = 0.0, max_value: float = 1.0) -> float:
+    return max(min_value, min(max_value, value))
+
+
+def compute_run_quality(
+    stats: RunQualityStats, length_median: Optional[float], params: MultirunParams
+) -> float:
+    """Compute a normalized [0, 1] quality score for a single run."""
+
+    hmm_score_norm = (
+        _clamp(float(stats.hmm_score)) if stats.hmm_score is not None else 0.5
+    )
+
+    if length_median and length_median > 0:
+        ratio = stats.length_m / length_median
+        diff = abs(ratio - 1.0)
+        length_consistency = max(0.0, 1.0 - diff / 0.5)
+    else:
+        length_consistency = 0.5
+
+    sensor_quality_norm = (
+        _clamp(float(stats.sensor_quality)) if stats.sensor_quality is not None else 0.5
+    )
+
+    w_hmm = 0.6
+    w_len = 0.3
+    w_sensor = 0.1
+
+    quality = w_hmm * hmm_score_norm + w_len * length_consistency + w_sensor * sensor_quality_norm
+    stats.quality = _clamp(quality)
+    return stats.quality
+
+
+def build_run_quality_stats(
+    runs: List[Run],
+    hmm_scores: Optional[dict[int, float]] = None,
+    sensor_summaries: Optional[dict[int, dict]] = None,
+) -> List[RunQualityStats]:
+    stats_list: List[RunQualityStats] = []
+    hmm_scores = hmm_scores or {}
+    sensor_summaries = sensor_summaries or {}
+
+    for run in runs:
+        sensor_summary = None
+        if isinstance(run.metadata, dict):
+            sensor_summary = run.metadata.get("sensor_summary")
+        if sensor_summaries and run.link_id in sensor_summaries:
+            sensor_summary = sensor_summaries.get(run.link_id)
+
+        sensor_quality = None
+        if isinstance(sensor_summary, dict):
+            candidate = sensor_summary.get("quality")
+            if isinstance(candidate, (int, float)):
+                sensor_quality = float(candidate)
+
+        stats_list.append(
+            RunQualityStats(
+                run_id=run.link_id,
+                length_m=_polyline_length(run.points),
+                hmm_score=hmm_scores.get(run.link_id),
+                sensor_quality=sensor_quality,
+            )
+        )
+
+    return stats_list
+
+
+def compute_and_filter_runs_by_quality(
+    stats_list: List[RunQualityStats],
+    params: MultirunParams,
+    logger: Optional[logging.Logger] = None,
+) -> Tuple[List[RunQualityStats], List[RunQualityStats]]:
+    if not stats_list:
+        return [], []
+
+    length_median = median([s.length_m for s in stats_list if s.length_m is not None])
+
+    for stats in stats_list:
+        if stats.quality is None:
+            compute_run_quality(stats, length_median, params)
+
+    if not params.use_quality_filter:
+        return stats_list, []
+
+    qualities = [s.quality for s in stats_list if s.quality is not None]
+    mean_q = mean(qualities) if qualities else 0.0
+    std_q = pstdev(qualities) if len(qualities) > 1 else 0.0
+
+    kept: List[RunQualityStats] = []
+    removed: List[RunQualityStats] = []
+
+    for stats in stats_list:
+        quality = stats.quality if stats.quality is not None else 0.0
+        is_low = quality < params.quality_min
+        is_outlier = quality < mean_q - params.outlier_sigma * std_q
+        if is_low or is_outlier:
+            removed.append(stats)
+        else:
+            kept.append(stats)
+
+    if not kept:
+        # Keep at least the best run to avoid empty results
+        best = max(stats_list, key=lambda s: s.quality or 0.0)
+        kept.append(best)
+        removed = [s for s in stats_list if s is not best]
+
+    if logger:
+        logger.debug(
+            "Quality filtering: mean=%.3f std=%.3f kept=%d removed=%d",
+            mean_q,
+            std_q,
+            len(kept),
+            len(removed),
+        )
+
+    return kept, removed
+
+
+def select_reference_run(
+    stats_list: List[RunQualityStats], params: MultirunParams
+) -> Optional[RunQualityStats]:
+    if not stats_list:
+        return None
+
+    if params.reference_method == "best_quality":
+        return max(stats_list, key=lambda s: s.quality if s.quality is not None else -math.inf)
+
+    # Fallback to best quality for unimplemented methods
+    return max(stats_list, key=lambda s: s.quality if s.quality is not None else -math.inf)
 
 
 def normalize_direction(reference_points: Sequence[Point], candidate_points: Sequence[Point]) -> List[Point]:
@@ -513,6 +665,7 @@ def write_unified_to_db(
     weights: Optional[dict] = None,
     width_profile: Optional[dict] = None,
     hmm: Optional[dict] = None,
+    removed_runs: Optional[List[dict]] = None,
 ) -> int:
     coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
     wkt = f"LINESTRING({coords})"
@@ -530,6 +683,8 @@ def write_unified_to_db(
         metadata["width_profile"] = width_profile
     if hmm:
         metadata["hmm"] = hmm
+    if removed_runs:
+        metadata["removed_runs"] = removed_runs
 
     with conn.cursor() as cur:
         cur.execute(
@@ -660,6 +815,7 @@ def unify_runs(
     estimate_width: bool = True,
     use_hmm: bool = False,
     hmm_debug: bool = False,
+    params: Optional[MultirunParams] = None,
 ) -> dict:
     if len(link_ids) < 2:
         raise ValueError("At least two link_ids are required for unification")
@@ -668,13 +824,23 @@ def unify_runs(
     if conn is None:
         raise ValueError("A database connection is required")
 
+    logger = logging.getLogger(__name__)
+    params = params or MultirunParams(use_hmm=use_hmm, hmm_debug=hmm_debug)
+    use_hmm = params.use_hmm
+    hmm_debug = params.hmm_debug
+
     runs = load_runs_from_db(conn, link_ids)
     if len(runs) < 2:
         raise ValueError("Not enough runs found for the provided link_ids")
 
     runs = _drop_outlier_runs_by_endpoints(runs)
-    if len(runs) < 2:
-        raise ValueError("Too few valid runs after outlier removal")
+    stats_list = build_run_quality_stats(runs)
+    kept_stats, removed_stats = compute_and_filter_runs_by_quality(
+        stats_list, params, logger=logger
+    )
+
+    kept_ids = {s.run_id for s in kept_stats}
+    runs = [r for r in runs if r.link_id in kept_ids]
 
     lengths = [_polyline_length(r.points) for r in runs]
     if not lengths:
@@ -685,10 +851,21 @@ def unify_runs(
     if max_len == 0 or (max_len - min_len) / max_len > 0.4:
         raise ValueError("Length difference between runs is too large")
 
-    # Normalize direction using the first run as reference
-    reference_points = runs[0].points
-    normalized_runs: List[Run] = [runs[0]]
-    for run in runs[1:]:
+    reference_stats = None
+    if params.use_quality_filter:
+        reference_stats = select_reference_run(kept_stats, params)
+    else:
+        reference_stats = next((s for s in stats_list if s.run_id == runs[0].link_id), None)
+    reference_run = next(
+        (r for r in runs if reference_stats and r.link_id == reference_stats.run_id),
+        runs[0],
+    )
+
+    reference_points = reference_run.points
+    normalized_runs: List[Run] = [reference_run]
+    for run in runs:
+        if run.link_id == reference_run.link_id:
+            continue
         aligned_points = normalize_direction(reference_points, run.points)
         normalized_runs.append(
             Run(link_id=run.link_id, points=aligned_points, metadata=run.metadata)
@@ -736,5 +913,9 @@ def unify_runs(
         weights=weight_map,
         width_profile=width_profile,
         hmm=hmm_summary if (use_hmm or hmm_debug) else None,
+        removed_runs=[
+            {"run_id": stats.run_id, "quality": stats.quality}
+            for stats in removed_stats
+        ],
     )
     return {"unified_link_id": new_link_id, "hmm": hmm_summary}

@@ -39,22 +39,26 @@ class DummyConnection:
 def stub_database(monkeypatch):
     dummy_conn = DummyConnection()
     monkeypatch.setattr(main, "get_connection", lambda: dummy_conn)
-    monkeypatch.setattr(
-        unify_multirun,
-        "unify_runs",
-        lambda link_ids, conn=None, resample_points=100, estimate_width=True, use_hmm=False, hmm_debug=False: {
+
+    def _fake_unify_runs(
+        link_ids,
+        conn=None,
+        resample_points=100,
+        estimate_width=True,
+        use_hmm=False,
+        hmm_debug=False,
+        params=None,
+    ):
+        enabled = bool(use_hmm)
+        if params is not None:
+            enabled = bool(params.use_hmm)
+        return {
             "unified_link_id": 999,
-            "hmm": {"enabled": bool(use_hmm), "matched_link_id": None, "matched_ratio": 0.5},
-        },
-    )
-    monkeypatch.setattr(
-        main,
-        "unify_runs",
-        lambda link_ids, conn=None, resample_points=100, estimate_width=True, use_hmm=False, hmm_debug=False: {
-            "unified_link_id": 999,
-            "hmm": {"enabled": bool(use_hmm), "matched_link_id": None, "matched_ratio": 0.5},
-        },
-    )
+            "hmm": {"enabled": enabled, "matched_link_id": None, "matched_ratio": 0.5},
+        }
+
+    monkeypatch.setattr(unify_multirun, "unify_runs", _fake_unify_runs)
+    monkeypatch.setattr(main, "unify_runs", _fake_unify_runs)
     yield
 
 
