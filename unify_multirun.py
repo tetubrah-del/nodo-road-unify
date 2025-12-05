@@ -1004,6 +1004,7 @@ def write_unified_to_db(
     hmm: Optional[dict] = None,
     removed_runs: Optional[List[dict]] = None,
     fusion: Optional[dict] = None,
+    multirun_summary: Optional[dict] = None,
 ) -> int:
     coords = ", ".join(f"{p['lon']} {p['lat']}" for p in points)
     wkt = f"LINESTRING({coords})"
@@ -1025,6 +1026,8 @@ def write_unified_to_db(
         metadata["removed_runs"] = removed_runs
     if fusion:
         metadata["fusion"] = fusion
+    if multirun_summary:
+        metadata["multirun_summary"] = multirun_summary
 
     with conn.cursor() as cur:
         cur.execute(
@@ -1272,7 +1275,9 @@ def unify_runs(
     )
     other_resampled = [r for r in resampled_runs if r.link_id != ref_resampled.link_id]
 
-    alignments, _ = build_alignment_mappings(ref_resampled, other_resampled, params)
+    alignments, resampled_alignment_costs = build_alignment_mappings(
+        ref_resampled, other_resampled, params
+    )
     if logger:
         logger.debug(
             "Built %d alignment mappings using %s method",
@@ -1310,6 +1315,47 @@ def unify_runs(
         "huber_delta": params.huber_delta,
         "tukey_c": params.tukey_c,
     }
+
+    alignment_cost_values = [
+        c
+        for c in alignment_costs.values()
+        if c is not None and not math.isinf(c)
+    ]
+    alignment_cost_values.extend(
+        c
+        for c in resampled_alignment_costs.values()
+        if c is not None and not math.isinf(c)
+    )
+    alignment_cost_values.extend(
+        s.alignment_cost
+        for s in kept_stats
+        if s.alignment_cost is not None and not math.isinf(s.alignment_cost)
+    )
+
+    sensor_modes = {"vehicle": 0, "gps_only": 0}
+    for run in clipped:
+        summary = None
+        if isinstance(run.metadata, dict):
+            summary = run.metadata.get("sensor_summary")
+        if isinstance(summary, dict):
+            mode = summary.get("mode")
+            if mode == "vehicle":
+                sensor_modes["vehicle"] += 1
+            elif mode == "off" or mode == "gps_only":
+                sensor_modes["gps_only"] += 1
+
+    multirun_summary = {
+        "run_count": len(kept_stats),
+        "alignment_costs": alignment_cost_values,
+        "alignment_cost_mean": mean(alignment_cost_values) if alignment_cost_values else None,
+        "alignment_cost_max": max(alignment_cost_values) if alignment_cost_values else None,
+        "sensor_modes": sensor_modes,
+    }
+    if isinstance(hmm_summary, dict):
+        match_ratio = hmm_summary.get("matched_ratio") or hmm_summary.get("match_ratio")
+        if match_ratio is not None:
+            multirun_summary["hmm_match_ratio_mean"] = match_ratio
+
     new_link_id = write_unified_to_db(
         conn,
         smoothed,
@@ -1327,5 +1373,6 @@ def unify_runs(
             for stats in removed_stats
         ],
         fusion=fusion_info,
+        multirun_summary=multirun_summary,
     )
     return {"unified_link_id": new_link_id, "hmm": hmm_summary}
