@@ -1246,6 +1246,9 @@ def map_page():
     let unifiedLayer = null;
     let gpsRawLayer = L.layerGroup();
     const segmentLayer = L.layerGroup().addTo(map);
+    const unifiedLayerById = new Map();
+    let hoveredSegment = null;
+    let hoveredUnified = null;
     let layerControl = null;
     let dangerMode = false;
 
@@ -1305,6 +1308,22 @@ def map_page():
       if (score < 3.5) return '#ffc000';   // caution (yellow)
       if (score < 4.3) return '#ed7d31';   // dangerous (orange)
       return '#c00000';                    // very dangerous (red)
+    }
+
+    function highlightSegment(layer) {
+      layer.setStyle({ weight: 8, opacity: 1.0 });
+    }
+
+    function resetSegment(layer) {
+      layer.setStyle({ weight: 6, opacity: 0.9 });
+    }
+
+    function highlightUnified(layer) {
+      layer.setStyle({ weight: 5, color: '#000', opacity: 1.0 });
+    }
+
+    function resetUnified(layer) {
+      layer.setStyle({ weight: 3, color: '#000', opacity: 0.7 });
     }
 
     function unifiedStyle(feature) {
@@ -1424,6 +1443,48 @@ def map_page():
       L.geoJSON(rawFeature, { style: gpsRawStyle }).addTo(gpsRawLayer);
     }
 
+    function attachSegmentHoverHandlers(feature, layer) {
+      const parentId = feature.properties?.parent_link_id;
+
+      layer.on('mouseover', () => {
+        if (hoveredSegment && hoveredSegment !== layer) {
+          resetSegment(hoveredSegment);
+        }
+        hoveredSegment = layer;
+        highlightSegment(layer);
+
+        if (parentId != null) {
+          const unified = unifiedLayerById.get(parentId);
+          if (unified) {
+            if (hoveredUnified && hoveredUnified !== unified) {
+              resetUnified(hoveredUnified);
+            }
+            hoveredUnified = unified;
+            highlightUnified(unified);
+          }
+        }
+
+        map.getContainer().style.cursor = 'pointer';
+      });
+
+      layer.on('mouseout', () => {
+        if (hoveredSegment === layer) {
+          resetSegment(layer);
+          hoveredSegment = null;
+        }
+
+        if (parentId != null) {
+          const unified = unifiedLayerById.get(parentId);
+          if (unified && hoveredUnified === unified) {
+            resetUnified(unified);
+            hoveredUnified = null;
+          }
+        }
+
+        map.getContainer().style.cursor = '';
+      });
+    }
+
     function loadSegments() {
       fetch('/api/road_segments_unified')
         .then(r => r.json())
@@ -1436,6 +1497,7 @@ def map_page():
               opacity: 0.9
             }),
             onEachFeature: (feature, layer) => {
+              attachSegmentHoverHandlers(feature, layer);
               const p = feature.properties || {};
               const score = p.danger_v5 != null ? p.danger_v5.toFixed(2) : 'n/a';
               layer.bindPopup([
@@ -1487,9 +1549,17 @@ def map_page():
         layerControl = null;
       }
 
+      unifiedLayerById.clear();
+
       unifiedLayer = L.geoJSON(unifiedGeojson, {
         style: unifiedStyle,
-        onEachFeature: (feature, layer) => bindUnifiedPopup(layer, feature.properties),
+        onEachFeature: (feature, layer) => {
+          const id = feature.properties?.link_id;
+          if (id != null) {
+            unifiedLayerById.set(id, layer);
+          }
+          bindUnifiedPopup(layer, feature.properties);
+        },
       }).addTo(map);
 
       rawLayer = L.geoJSON(rawGeojson, {
