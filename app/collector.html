@@ -63,6 +63,24 @@
     @media (max-width: 420px) {
       .big-btn { width:100%; }
     }
+    .danger-rt-box {
+      padding: 10px 12px;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .danger-rt-current {
+      font-weight: bold;
+      font-size: 20px;
+    }
+    .danger-rt-max {
+      font-size: 14px;
+      color: #555;
+    }
   </style>
 </head>
 <body>
@@ -84,6 +102,11 @@
       メモ (任意)
       <textarea id="note" rows="2"></textarea>
     </label>
+    <div class="danger-rt-box">
+      <div>Danger (RT)</div>
+      <div id="danger-rt-value" class="danger-rt-current">–</div>
+      <div id="danger-rt-max" class="danger-rt-max">Max: –</div>
+    </div>
     <div id="error"></div>
     <div id="collector-last-result" style="margin-top: 8px; font-size: 0.9rem;"></div>
     <div style="font-size:12px; color:#777;">ブラウザの位置情報を許可してから記録してください。</div>
@@ -108,6 +131,16 @@
   </div>
 
   <script>
+    const DangerRtParams = {
+      roughnessScale: 0.4, // g
+      pitchStdScale: 5.0, // degrees
+      speedMin: 1.0, // m/s
+      speedMax: 15.0, // m/s
+      wRoughness: 0.6,
+      wPitch: 0.3,
+      wSpeed: 0.1,
+    };
+
     const map = L.map("map").setView([33.1471, 131.5218], 16);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 18,
@@ -126,6 +159,8 @@
     const sensorToggle = document.getElementById("sensorToggle");
     const sensorStatusEl = document.getElementById("sensor-status");
     const sensorModeLabelEl = document.getElementById("sensor-mode-label");
+    const dangerRtValueEl = document.getElementById("danger-rt-value");
+    const dangerRtMaxEl = document.getElementById("danger-rt-max");
     const wakeLockStatusEl = document.createElement('div');
     wakeLockStatusEl.id = 'wake-lock-status';
     wakeLockStatusEl.style.fontSize = '13px';
@@ -138,6 +173,7 @@
 
     let wakeLock = null;
     let isRecording = false;
+    let latestSpeedMps = null;
 
     const wakeLockSupported = typeof navigator !== 'undefined' && 'wakeLock' in navigator;
 
@@ -211,6 +247,7 @@
       let pitchSum = 0;
       let pitchCount = 0;
       let lastPitchDeg = null;
+      let dangerRtTracker = null;
 
       const resetStats = () => {
         sumSquares = 0;
@@ -243,6 +280,18 @@
         if (typeof lastPitchDeg === 'number') {
           pitchSum += lastPitchDeg;
           pitchCount += 1;
+        }
+
+        if (dangerRtTracker) {
+          const now = Date.now();
+          dangerRtTracker.addSample({
+            accZ: vertical,
+            pitchDeg: typeof lastPitchDeg === 'number' ? lastPitchDeg : null,
+            speedMps: typeof latestSpeedMps === 'number' ? latestSpeedMps : null,
+            timestamp: now,
+          });
+          const updated = dangerRtTracker.maybeUpdate(now);
+          updateDangerRtDisplay(updated, dangerRtTracker.getSummary().max);
         }
       };
 
@@ -333,10 +382,135 @@
         };
       };
 
-      return { enable, disable, startSession, stopSession, getSummary };
+      const setDangerTracker = (tracker) => {
+        dangerRtTracker = tracker;
+      };
+
+      return { enable, disable, startSession, stopSession, getSummary, setDangerTracker };
     }
 
     const sensorTracker = createSensorTracker();
+
+    function computeRtMetrics(samples) {
+      if (!Array.isArray(samples) || samples.length === 0) {
+        return { vertRms: null, pitchStd: null, speedMean: null };
+      }
+
+      let sumSq = 0;
+      let accCount = 0;
+      const pitchValues = [];
+      let speedSum = 0;
+      let speedCount = 0;
+
+      for (const s of samples) {
+        if (typeof s.accZ === 'number' && !Number.isNaN(s.accZ)) {
+          sumSq += s.accZ * s.accZ;
+          accCount += 1;
+        }
+        if (typeof s.pitchDeg === 'number' && !Number.isNaN(s.pitchDeg)) {
+          pitchValues.push(s.pitchDeg);
+        }
+        if (typeof s.speedMps === 'number' && !Number.isNaN(s.speedMps)) {
+          speedSum += s.speedMps;
+          speedCount += 1;
+        }
+      }
+
+      const vertRms = accCount > 0 ? Math.sqrt(sumSq / accCount) : null;
+
+      let pitchStd = null;
+      if (pitchValues.length > 0) {
+        const mean = pitchValues.reduce((a, b) => a + b, 0) / pitchValues.length;
+        const variance =
+          pitchValues.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) /
+          pitchValues.length;
+        pitchStd = Math.sqrt(variance);
+      }
+
+      const speedMean = speedCount > 0 ? speedSum / speedCount : null;
+
+      return { vertRms, pitchStd, speedMean };
+    }
+
+    function computeDangerRt(metrics, params = DangerRtParams) {
+      const { vertRms, pitchStd, speedMean } = metrics || {};
+
+      const roughNorm = Math.min(1, (vertRms || 0) / params.roughnessScale);
+      const pitchNorm = Math.min(1, (pitchStd || 0) / params.pitchStdScale);
+
+      let speedNorm = 0;
+      if (speedMean != null) {
+        const s = Math.max(params.speedMin, Math.min(speedMean, params.speedMax));
+        speedNorm = (s - params.speedMin) / (params.speedMax - params.speedMin);
+      }
+
+      const intensity =
+        params.wRoughness * roughNorm +
+        params.wPitch * pitchNorm +
+        params.wSpeed * speedNorm;
+
+      const clamped = Math.max(0, Math.min(1, intensity));
+      return 1 + clamped * 4;
+    }
+
+    function createDangerRtTracker({ windowMs = 3000, minIntervalMs = 600 } = {}) {
+      let samples = [];
+      let lastEval = 0;
+      let current = null;
+      let maxVal = null;
+      let sum = 0;
+      let count = 0;
+
+      const reset = () => {
+        samples = [];
+        lastEval = 0;
+        current = null;
+        maxVal = null;
+        sum = 0;
+        count = 0;
+      };
+
+      const addSample = (sample) => {
+        if (!sample || typeof sample.timestamp !== 'number') return;
+        samples.push(sample);
+        const cutoff = sample.timestamp - windowMs;
+        while (samples.length && samples[0].timestamp < cutoff) {
+          samples.shift();
+        }
+      };
+
+      const maybeUpdate = (now = Date.now()) => {
+        if (now - lastEval < minIntervalMs && current !== null) {
+          return current;
+        }
+        lastEval = now;
+        if (!samples.length) {
+          current = 1.0;
+          return current;
+        }
+        const metrics = computeRtMetrics(samples);
+        const score = computeDangerRt(metrics);
+        current = typeof score === 'number' && !Number.isNaN(score) ? score : 1.0;
+        if (maxVal === null || current > maxVal) {
+          maxVal = current;
+        }
+        sum += current;
+        count += 1;
+        return current;
+      };
+
+      const getSummary = () => ({
+        current,
+        max: maxVal,
+        mean: count > 0 ? sum / count : null,
+        samples: samples.slice(),
+      });
+
+      return { reset, addSample, maybeUpdate, getSummary };
+    }
+
+    const dangerRtTracker = createDangerRtTracker();
+    sensorTracker.setDangerTracker(dangerRtTracker);
 
     function setStatus(text) {
       statusEl.textContent = text;
@@ -359,6 +533,28 @@
       pointsCountEl.textContent = `記録ポイント数: ${recordedPoints.length}`;
     }
 
+    function updateDangerRtDisplay(current, maxVal) {
+      const displayVal = typeof current === 'number' ? current.toFixed(1) : '–';
+      dangerRtValueEl.textContent = `Danger (RT): ${displayVal}`;
+
+      const maxDisplay = typeof maxVal === 'number' ? maxVal.toFixed(1) : '–';
+      dangerRtMaxEl.textContent = `Max: ${maxDisplay}`;
+
+      let color = '#2e7d32';
+      if (typeof current === 'number') {
+        if (current >= 3.5) {
+          color = '#c62828';
+        } else if (current >= 2.0) {
+          color = '#f9a825';
+        }
+      }
+      dangerRtValueEl.style.color = color;
+    }
+
+    function resetDangerRtDisplay() {
+      updateDangerRtDisplay(null, null);
+    }
+
     function resetRecording() {
       recordedPoints = [];
       updatePointsCount();
@@ -366,6 +562,8 @@
         map.removeLayer(polyline);
         polyline = null;
       }
+      dangerRtTracker.reset();
+      resetDangerRtDisplay();
     }
 
     function renderRecentRuns(rows) {
@@ -477,7 +675,10 @@
       startBtn.disabled = true;
       stopSendBtn.disabled = false;
       sensorTracker.startSession();
+      dangerRtTracker.reset();
+      resetDangerRtDisplay();
       isRecording = true;
+      latestSpeedMps = null;
 
       if (!navigator.geolocation) {
         alert("この端末はGPSが使えません");
@@ -495,7 +696,22 @@
           (pos) => {
             const lat = pos.coords.latitude;
             const lon = pos.coords.longitude;
-            const point = { lat, lon, timestamp_ms: Date.now() };
+            const nowTs = Date.now();
+            let speedMps =
+              typeof pos.coords.speed === 'number' && !Number.isNaN(pos.coords.speed)
+                ? pos.coords.speed
+                : null;
+            if (speedMps === null && recordedPoints.length > 0) {
+              const prev = recordedPoints[recordedPoints.length - 1];
+              const dtSec = (nowTs - prev.timestamp_ms) / 1000;
+              if (dtSec > 0) {
+                const dist = haversineDistanceMeters(prev, { lat, lon });
+                speedMps = dist / dtSec;
+              }
+            }
+            latestSpeedMps = speedMps;
+
+            const point = { lat, lon, timestamp_ms: nowTs, speed_mps: speedMps };
             recordedPoints.push(point);
             updatePointsCount();
 
@@ -504,6 +720,9 @@
             } else {
               polyline.addLatLng([lat, lon]);
             }
+
+            const dangerNow = dangerRtTracker.maybeUpdate(Date.now());
+            updateDangerRtDisplay(dangerNow, dangerRtTracker.getSummary().max);
           },
           (err) => {
             console.error(err);
@@ -546,6 +765,7 @@
 
       setStatus("送信中...");
       const currentPoints = recordedPoints.slice();
+      const dangerSummary = dangerRtTracker.getSummary();
       try {
         setError('');
         const res = await fetch('/api/collector/submit', {
@@ -553,7 +773,11 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({
             points: recordedPoints,
-            sensor_summary: sensorTracker.getSummary(),
+            sensor_summary: {
+              ...sensorTracker.getSummary(),
+              danger_rt_mean: dangerSummary.mean ?? null,
+              danger_rt_max: dangerSummary.max ?? null,
+            },
             meta: { note: noteEl.value || undefined },
           }),
         });
