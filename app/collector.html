@@ -10,127 +10,966 @@
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <style>
     body, html { margin:0; padding:0; height:100%; }
-    #map { height:60%; }
-    #controls { padding:8px; }
+    body { display:flex; flex-direction:column; background:#f5f5f5; }
+    #map { height:calc(50vh); min-height:45vh; width:100%; }
+    #controls {
+      padding:16px;
+      background:#f5f5f5;
+      display:flex;
+      flex-direction:column;
+      gap:12px;
+      box-sizing:border-box;
+      max-width:480px;
+      width:100%;
+      margin:0 auto;
+      flex:1;
+    }
+    .button-row {
+      display:flex;
+      flex-direction:column;
+      gap:8px;
+      width:100%;
+      margin-top:8px;
+    }
+    .big-btn {
+      padding:16px 20px;
+      font-size:18px;
+      width:100%;
+      border-radius:10px;
+      min-height:56px;
+      border:1px solid #ccc;
+      background:#fff;
+      cursor:pointer;
+    }
+    #status { font-weight:bold; color:#333; font-size:16px; margin-top:4px; }
+    #points-count { font-size:15px; color:#555; }
+    #error { font-size:14px; color:#c62828; margin-top:4px; }
+    .toggle-row {
+      display:flex;
+      align-items:center;
+      gap:12px;
+      font-size:16px;
+      min-height:44px;
+      padding:4px 0;
+    }
+    .toggle-row .sensor-checkbox {
+      transform: scale(1.4);
+      margin-right:8px;
+    }
+    .toggle-row span { font-size:14px; color:#555; }
+    #sensor-status { font-size:14px; color:#555; }
+    .note-label { font-size:13px; color:#555; display:flex; flex-direction:column; gap:4px; }
+    textarea#note { width:100%; font-size:14px; padding:8px; box-sizing:border-box; }
+    @media (max-width: 420px) {
+      .big-btn { width:100%; }
+    }
+    .danger-rt-box {
+      padding: 10px 12px;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 14px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    .danger-rt-current {
+      font-weight: bold;
+      font-size: 20px;
+    }
+    .danger-rt-max {
+      font-size: 14px;
+      color: #555;
+    }
+
+    #roughness-panel {
+      margin-top: 8px;
+      padding: 8px 10px;
+      background: #fff;
+      border: 1px solid #ddd;
+      border-radius: 8px;
+      font-size: 13px;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    #roughness-sparkline {
+      display: flex;
+      align-items: flex-end;
+      gap: 2px;
+      height: 40px;
+    }
+
+    .roughness-bar {
+      width: 4px;
+      background: #3f51b5;
+      border-radius: 2px 2px 0 0;
+    }
   </style>
 </head>
 <body>
   <div id="map"></div>
   <div id="controls">
-    <button id="startBtn">記録開始</button>
-    <button id="stopBtn" disabled>記録停止</button>
-
-    <div>
-      幅員(m): <input id="width" type="number" step="0.1" value="3">
+    <div class="button-row">
+      <button id="startBtn" class="big-btn">記録開始</button>
+      <button id="stopSendBtn" class="big-btn" disabled>記録停止＆送信</button>
     </div>
-    <div>
-      ground_condition:
-      <select id="ground">
-        <option value="1">1: 良い</option>
-        <option value="2">2: やや悪い</option>
-        <option value="3" selected>3: 悪い</option>
-        <option value="4">4: かなり悪い</option>
-      </select>
+    <div id="points-count">記録ポイント数: 0</div>
+    <div id="status">待機中</div>
+    <label class="toggle-row">
+      <input type="checkbox" id="sensorToggle" class="sensor-checkbox" />
+      車両固定モード（センサー ON/OFF）
+      <span id="sensor-mode-label"></span>
+    </label>
+    <div id="sensor-status"></div>
+    <label class="note-label">
+      メモ (任意)
+      <textarea id="note" rows="2"></textarea>
+    </label>
+    <div class="danger-rt-box">
+      <div>Danger (RT)</div>
+      <div id="danger-rt-value" class="danger-rt-current">–</div>
+      <div id="danger-rt-max" class="danger-rt-max">Max: –</div>
     </div>
-
-    <button id="sendBtn" disabled>サーバに送信</button>
-    <div id="status"></div>
+    <div id="roughness-panel">
+      <div>Roughness history</div>
+      <div id="roughness-sparkline"></div>
+    </div>
+    <div id="error"></div>
+    <div id="collector-last-result" style="margin-top: 8px; font-size: 0.9rem;"></div>
+    <div style="font-size:12px; color:#777;">ブラウザの位置情報を許可してから記録してください。</div>
+    <hr />
+    <h3 style="font-size: 1rem; margin-top: 8px;">直近の記録一覧（デバッグ用）</h3>
+    <button id="refresh-recent-runs" type="button">一覧を更新</button>
+    <div id="recent-runs-status" style="margin-top: 4px; font-size: 0.8rem;"></div>
+    <table id="recent-runs-table" style="width: 100%; font-size: 0.8rem; margin-top: 4px; border-collapse: collapse;">
+      <thead>
+        <tr>
+          <th style="border-bottom: 1px solid #ccc;">link_id</th>
+          <th style="border-bottom: 1px solid #ccc;">危険度</th>
+          <th style="border-bottom: 1px solid #ccc;">距離[m]</th>
+          <th style="border-bottom: 1px solid #ccc;">スナップ</th>
+          <th style="border-bottom: 1px solid #ccc;">距離差[m]</th>
+          <th style="border-bottom: 1px solid #ccc;">モード</th>
+          <th style="border-bottom: 1px solid #ccc;">点数</th>
+        </tr>
+      </thead>
+      <tbody></tbody>
+    </table>
   </div>
 
   <script>
+    const DangerRtParams = {
+      roughnessScale: 0.4, // g
+      pitchStdScale: 5.0, // degrees
+      speedMin: 1.0, // m/s
+      speedMax: 15.0, // m/s
+      wRoughness: 0.6,
+      wPitch: 0.3,
+      wSpeed: 0.1,
+    };
+
+    const PITCH_SMOOTH_ALPHA = 0.2;
+    let smoothedPitch = null;
+
+    function updateSmoothedPitch(rawPitchDeg) {
+      if (rawPitchDeg == null || Number.isNaN(rawPitchDeg)) return smoothedPitch;
+      if (smoothedPitch == null) {
+        smoothedPitch = rawPitchDeg;
+      } else {
+        smoothedPitch =
+          PITCH_SMOOTH_ALPHA * rawPitchDeg +
+          (1 - PITCH_SMOOTH_ALPHA) * smoothedPitch;
+      }
+      return smoothedPitch;
+    }
+
     const map = L.map("map").setView([33.1471, 131.5218], 16);
     L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
       maxZoom: 18,
     }).addTo(map);
 
     let watchId = null;
-    let points = [];
+    let recordedPoints = [];
     let polyline = null;
 
     const startBtn = document.getElementById("startBtn");
-    const stopBtn  = document.getElementById("stopBtn");
-    const sendBtn  = document.getElementById("sendBtn");
+    const stopSendBtn  = document.getElementById("stopSendBtn");
     const statusEl = document.getElementById("status");
+    const pointsCountEl = document.getElementById("points-count");
+    const noteEl = document.getElementById("note");
+    const errorEl = document.getElementById("error");
+    const sensorToggle = document.getElementById("sensorToggle");
+    const sensorStatusEl = document.getElementById("sensor-status");
+    const sensorModeLabelEl = document.getElementById("sensor-mode-label");
+    const dangerRtValueEl = document.getElementById("danger-rt-value");
+    const dangerRtMaxEl = document.getElementById("danger-rt-max");
+    const roughnessSparklineEl = document.getElementById("roughness-sparkline");
+    const wakeLockStatusEl = document.createElement('div');
+    wakeLockStatusEl.id = 'wake-lock-status';
+    wakeLockStatusEl.style.fontSize = '13px';
+    wakeLockStatusEl.style.color = '#555';
+    sensorStatusEl.insertAdjacentElement('afterend', wakeLockStatusEl);
+    const lastResultEl = document.getElementById("collector-last-result");
+    const recentRunsBtn = document.getElementById("refresh-recent-runs");
+    const recentRunsStatusEl = document.getElementById("recent-runs-status");
+    const recentRunsTableBody = document.querySelector("#recent-runs-table tbody");
 
-    startBtn.onclick = () => {
-      points = [];
+    let wakeLock = null;
+    let isRecording = false;
+    let latestSpeedMps = null;
+
+    const wakeLockSupported = typeof navigator !== 'undefined' && 'wakeLock' in navigator;
+
+    const setWakeLockLabel = (state) => {
+      if (!wakeLockStatusEl) return;
+      if (!wakeLockSupported) {
+        wakeLockStatusEl.textContent = '画面スリープ防止: 未対応';
+        return;
+      }
+      const label = state === 'active' ? '画面スリープ防止: 有効' : '画面スリープ防止: 無効';
+      wakeLockStatusEl.textContent = label;
+    };
+
+    setWakeLockLabel('inactive');
+
+    async function enableWakeLock() {
+      if (!wakeLockSupported) {
+        console.info('Wake Lock API not supported');
+        setWakeLockLabel('inactive');
+        return;
+      }
+      if (wakeLock) return;
+      try {
+        wakeLock = await navigator.wakeLock.request('screen');
+        wakeLock.addEventListener('release', () => {
+          console.log('Screen Wake Lock was released');
+          setWakeLockLabel('inactive');
+        });
+        console.log('Screen Wake Lock is active');
+        setWakeLockLabel('active');
+      } catch (err) {
+        console.warn('Failed to acquire Wake Lock', err);
+        wakeLock = null;
+        setWakeLockLabel('inactive');
+      }
+    }
+
+    async function disableWakeLock() {
+      if (!wakeLock) {
+        setWakeLockLabel('inactive');
+        return;
+      }
+      try {
+        await wakeLock.release();
+      } catch (err) {
+        console.warn('Failed to release Wake Lock', err);
+      }
+      wakeLock = null;
+      setWakeLockLabel('inactive');
+    }
+
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && isRecording) {
+        enableWakeLock();
+      } else if (document.visibilityState === 'hidden') {
+        disableWakeLock();
+      }
+    });
+
+    window.addEventListener('pagehide', () => {
+      disableWakeLock();
+    });
+
+    function computeStd(values) {
+      if (!Array.isArray(values) || values.length === 0) return null;
+      const mean = values.reduce((acc, v) => acc + v, 0) / values.length;
+      const variance = values.reduce((acc, v) => acc + Math.pow(v - mean, 2), 0) / values.length;
+      return Math.sqrt(variance);
+    }
+
+    function computeRms(values) {
+      if (!Array.isArray(values) || values.length === 0) return null;
+      const sumSq = values.reduce((acc, v) => acc + v * v, 0);
+      return Math.sqrt(sumSq / values.length);
+    }
+
+    function createSensorTracker() {
+      let enabled = false;
+      let sessionActive = false;
+      let listenersAttached = false;
+      let sumSquares = 0;
+      let maxAbs = 0;
+      let sampleCount = 0;
+      let pitchSum = 0;
+      let pitchCount = 0;
+      let lastPitchDeg = null;
+      let lastSmoothedPitchDeg = null;
+      let pitchSmoothValues = [];
+      let pitchSmoothMin = null;
+      let pitchSmoothMax = null;
+      let lastRawPitchDeg = null;
+      let lastAccZ = null;
+      let lastAccTimestamp = null;
+      let jerkValues = [];
+      let jerkMaxAbs = null;
+      let dangerRtTracker = null;
+
+      const resetStats = () => {
+        sumSquares = 0;
+        maxAbs = 0;
+        sampleCount = 0;
+        pitchSum = 0;
+        pitchCount = 0;
+        smoothedPitch = null;
+        pitchSmoothValues = [];
+        pitchSmoothMin = null;
+        pitchSmoothMax = null;
+        lastSmoothedPitchDeg = null;
+        lastRawPitchDeg = null;
+        lastAccZ = null;
+        lastAccTimestamp = null;
+        jerkValues = [];
+        jerkMaxAbs = null;
+      };
+
+      const handleOrientation = (event) => {
+        if (typeof event.beta === 'number') {
+          lastPitchDeg = event.beta;
+        }
+      };
+
+      const handleMotion = (event) => {
+        if (!sessionActive) return;
+        const acc = event.accelerationIncludingGravity || event.acceleration;
+        if (!acc || typeof acc.z !== 'number') return;
+        const vertical = acc.z;
+        const absVal = Math.abs(vertical);
+        sumSquares += vertical * vertical;
+        sampleCount += 1;
+        if (sampleCount === 1) {
+          maxAbs = absVal;
+        } else {
+          maxAbs = Math.max(maxAbs, absVal);
+        }
+
+        if (typeof lastPitchDeg === 'number') {
+          pitchSum += lastPitchDeg;
+          pitchCount += 1;
+        }
+
+        const rawPitch = typeof lastPitchDeg === 'number' ? lastPitchDeg : null;
+        lastRawPitchDeg = rawPitch;
+        const smoothed = updateSmoothedPitch(rawPitch);
+        if (typeof smoothed === 'number' && !Number.isNaN(smoothed)) {
+          lastSmoothedPitchDeg = smoothed;
+          pitchSmoothValues.push(smoothed);
+          pitchSmoothMin = pitchSmoothMin == null ? smoothed : Math.min(pitchSmoothMin, smoothed);
+          pitchSmoothMax = pitchSmoothMax == null ? smoothed : Math.max(pitchSmoothMax, smoothed);
+        }
+
+        const now = Date.now();
+        if (lastAccZ != null && typeof lastAccTimestamp === 'number') {
+          const dtSec = (now - lastAccTimestamp) / 1000;
+          const jerkZ = dtSec > 0 ? (vertical - lastAccZ) / dtSec : 0;
+          if (!Number.isNaN(jerkZ) && Number.isFinite(jerkZ)) {
+            jerkValues.push(jerkZ);
+            const absJerk = Math.abs(jerkZ);
+            jerkMaxAbs = jerkMaxAbs == null ? absJerk : Math.max(jerkMaxAbs, absJerk);
+          }
+        }
+        lastAccZ = vertical;
+        lastAccTimestamp = now;
+
+        if (dangerRtTracker) {
+          dangerRtTracker.addSample({
+            accZ: vertical,
+            pitchDeg: typeof lastPitchDeg === 'number' ? lastPitchDeg : null,
+            speedMps: typeof latestSpeedMps === 'number' ? latestSpeedMps : null,
+            timestamp: now,
+          });
+          const updated = dangerRtTracker.maybeUpdate(now);
+          const summary = dangerRtTracker.getSummary();
+          updateDangerRtDisplay(updated, summary.max);
+          renderRoughnessSparkline(summary.roughnessHistory);
+        }
+      };
+
+      const attachListeners = () => {
+        if (listenersAttached) return;
+        window.addEventListener('devicemotion', handleMotion);
+        window.addEventListener('deviceorientation', handleOrientation);
+        listenersAttached = true;
+        console.log('[sensor] listeners attached');
+      };
+
+      const detachListeners = () => {
+        if (!listenersAttached) return;
+        window.removeEventListener('devicemotion', handleMotion);
+        window.removeEventListener('deviceorientation', handleOrientation);
+        listenersAttached = false;
+        console.log('[sensor] listeners detached');
+      };
+
+      const ensurePermission = async () => {
+        if (typeof DeviceMotionEvent === 'undefined') {
+          console.warn('[sensor] DeviceMotionEvent not available');
+          return false;
+        }
+
+        // iOS Safari requires an explicit permission request
+        if (typeof DeviceMotionEvent.requestPermission === 'function') {
+          try {
+            const resp = await DeviceMotionEvent.requestPermission();
+            return resp === 'granted';
+          } catch (e) {
+            console.warn('[sensor] permission request failed', e);
+            return false;
+          }
+        }
+        return true;
+      };
+
+      const enable = async () => {
+        const permitted = await ensurePermission();
+        enabled = permitted;
+        if (enabled) {
+          attachListeners();
+        } else {
+          detachListeners();
+        }
+        return enabled;
+      };
+
+      const disable = () => {
+        enabled = false;
+        detachListeners();
+      };
+
+      const startSession = () => {
+        resetStats();
+        sessionActive = true;
+        if (enabled) {
+          attachListeners();
+        }
+      };
+
+      const stopSession = () => {
+        sessionActive = false;
+      };
+
+      const getSummary = () => {
+        if (!enabled) {
+          return {
+            mode: 'off',
+            vertical_rms: null,
+            vertical_max: null,
+            pitch_mean_deg: null,
+            pitch_smooth_std: null,
+            pitch_smooth_range: null,
+            jerk_rms: null,
+            jerk_max_abs: null,
+            sensor_samples: 0,
+          };
+        }
+
+        const vertical_rms = sampleCount > 0 ? Math.sqrt(sumSquares / sampleCount) : null;
+        const vertical_max = sampleCount > 0 ? maxAbs : null;
+        const pitch_mean_deg = pitchCount > 0 ? pitchSum / pitchCount : null;
+        const pitch_smooth_std = computeStd(pitchSmoothValues);
+        const pitch_smooth_range =
+          pitchSmoothMin != null && pitchSmoothMax != null
+            ? pitchSmoothMax - pitchSmoothMin
+            : null;
+        const jerk_rms = computeRms(jerkValues);
+        const jerk_max_abs = jerkMaxAbs;
+
+        return {
+          mode: 'vehicle',
+          vertical_rms,
+          vertical_max,
+          pitch_mean_deg,
+          pitch_smooth_std,
+          pitch_smooth_range,
+          jerk_rms,
+          jerk_max_abs,
+          sensor_samples: sampleCount,
+        };
+      };
+
+      const setDangerTracker = (tracker) => {
+        dangerRtTracker = tracker;
+      };
+
+      return { enable, disable, startSession, stopSession, getSummary, setDangerTracker };
+    }
+
+    const sensorTracker = createSensorTracker();
+
+    function computeRtMetrics(samples) {
+      if (!Array.isArray(samples) || samples.length === 0) {
+        return { vertRms: null, pitchStd: null, speedMean: null };
+      }
+
+      let sumSq = 0;
+      let accCount = 0;
+      const pitchValues = [];
+      let speedSum = 0;
+      let speedCount = 0;
+
+      for (const s of samples) {
+        if (typeof s.accZ === 'number' && !Number.isNaN(s.accZ)) {
+          sumSq += s.accZ * s.accZ;
+          accCount += 1;
+        }
+        if (typeof s.pitchDeg === 'number' && !Number.isNaN(s.pitchDeg)) {
+          pitchValues.push(s.pitchDeg);
+        }
+        if (typeof s.speedMps === 'number' && !Number.isNaN(s.speedMps)) {
+          speedSum += s.speedMps;
+          speedCount += 1;
+        }
+      }
+
+      const vertRms = accCount > 0 ? Math.sqrt(sumSq / accCount) : null;
+
+      let pitchStd = null;
+      if (pitchValues.length > 0) {
+        const mean = pitchValues.reduce((a, b) => a + b, 0) / pitchValues.length;
+        const variance =
+          pitchValues.reduce((acc, val) => acc + Math.pow(val - mean, 2), 0) /
+          pitchValues.length;
+        pitchStd = Math.sqrt(variance);
+      }
+
+      const speedMean = speedCount > 0 ? speedSum / speedCount : null;
+
+      return { vertRms, pitchStd, speedMean };
+    }
+
+    function computeDangerRt(metrics, params = DangerRtParams) {
+      const { vertRms, pitchStd, speedMean } = metrics || {};
+
+      const roughNorm = Math.min(1, (vertRms || 0) / params.roughnessScale);
+      const pitchNorm = Math.min(1, (pitchStd || 0) / params.pitchStdScale);
+
+      let speedNorm = 0;
+      if (speedMean != null) {
+        const s = Math.max(params.speedMin, Math.min(speedMean, params.speedMax));
+        speedNorm = (s - params.speedMin) / (params.speedMax - params.speedMin);
+      }
+
+      const intensity =
+        params.wRoughness * roughNorm +
+        params.wPitch * pitchNorm +
+        params.wSpeed * speedNorm;
+
+      const clamped = Math.max(0, Math.min(1, intensity));
+      return 1 + clamped * 4;
+    }
+
+    function createDangerRtTracker({
+      windowMs = 3000,
+      minIntervalMs = 600,
+      roughnessHistorySize = 50,
+    } = {}) {
+      let samples = [];
+      let lastEval = 0;
+      let current = null;
+      let maxVal = null;
+      let sum = 0;
+      let count = 0;
+      let lastVertRms = null;
+      let roughnessHistory = [];
+
+      const reset = () => {
+        samples = [];
+        lastEval = 0;
+        current = null;
+        maxVal = null;
+        sum = 0;
+        count = 0;
+        lastVertRms = null;
+        roughnessHistory = [];
+      };
+
+      const addSample = (sample) => {
+        if (!sample || typeof sample.timestamp !== 'number') return;
+        samples.push(sample);
+        const cutoff = sample.timestamp - windowMs;
+        while (samples.length && samples[0].timestamp < cutoff) {
+          samples.shift();
+        }
+      };
+
+      const maybeUpdate = (now = Date.now()) => {
+        if (now - lastEval < minIntervalMs && current !== null) {
+          return current;
+        }
+        lastEval = now;
+        if (!samples.length) {
+          current = 1.0;
+          return current;
+        }
+        const metrics = computeRtMetrics(samples);
+        lastVertRms = metrics.vertRms;
+        const score = computeDangerRt(metrics);
+        current = typeof score === 'number' && !Number.isNaN(score) ? score : 1.0;
+        if (maxVal === null || current > maxVal) {
+          maxVal = current;
+        }
+        sum += current;
+        count += 1;
+        if (typeof lastVertRms === 'number' && !Number.isNaN(lastVertRms)) {
+          roughnessHistory.push(lastVertRms);
+          while (roughnessHistory.length > roughnessHistorySize) {
+            roughnessHistory.shift();
+          }
+        }
+        return current;
+      };
+
+      const getSummary = () => ({
+        current,
+        max: maxVal,
+        mean: count > 0 ? sum / count : null,
+        samples: samples.slice(),
+        roughnessHistory: roughnessHistory.slice(),
+      });
+
+      return { reset, addSample, maybeUpdate, getSummary };
+    }
+
+    const dangerRtTracker = createDangerRtTracker();
+    sensorTracker.setDangerTracker(dangerRtTracker);
+
+    function setStatus(text) {
+      statusEl.textContent = text;
+    }
+
+    function setError(text) {
+      errorEl.textContent = text || '';
+    }
+
+    function setLastResult(text) {
+      lastResultEl.textContent = text || '';
+    }
+
+    function updateSensorModeLabel() {
+      const on = sensorToggle.checked;
+      sensorModeLabelEl.textContent = on ? 'モード: 車両センサーON' : 'モード: GPSのみ';
+    }
+
+    function updatePointsCount() {
+      pointsCountEl.textContent = `記録ポイント数: ${recordedPoints.length}`;
+    }
+
+    function updateDangerRtDisplay(current, maxVal) {
+      const displayVal = typeof current === 'number' ? current.toFixed(1) : '–';
+      dangerRtValueEl.textContent = `Danger (RT): ${displayVal}`;
+
+      const maxDisplay = typeof maxVal === 'number' ? maxVal.toFixed(1) : '–';
+      dangerRtMaxEl.textContent = `Max: ${maxDisplay}`;
+
+      let color = '#2e7d32';
+      if (typeof current === 'number') {
+        if (current >= 3.5) {
+          color = '#c62828';
+        } else if (current >= 2.0) {
+          color = '#f9a825';
+        }
+      }
+      dangerRtValueEl.style.color = color;
+    }
+
+    function resetDangerRtDisplay() {
+      updateDangerRtDisplay(null, null);
+      renderRoughnessSparkline([]);
+    }
+
+    function renderRoughnessSparkline(history) {
+      if (!roughnessSparklineEl) return;
+      roughnessSparklineEl.innerHTML = '';
+      if (!Array.isArray(history) || history.length === 0) return;
+      const validValues = history.filter((v) => typeof v === 'number' && !Number.isNaN(v));
+      if (!validValues.length) return;
+      const maxVal = Math.max(...validValues);
+      if (maxVal <= 0) return;
+      validValues.forEach((val) => {
+        const bar = document.createElement('div');
+        bar.className = 'roughness-bar';
+        const norm = Math.min(1, Math.max(0, val / maxVal));
+        const heightPct = Math.max(5, norm * 100);
+        bar.style.height = `${heightPct}%`;
+        roughnessSparklineEl.appendChild(bar);
+      });
+    }
+
+    function resetRecording() {
+      recordedPoints = [];
+      updatePointsCount();
       if (polyline) {
         map.removeLayer(polyline);
         polyline = null;
       }
+      dangerRtTracker.reset();
+      resetDangerRtDisplay();
+    }
+
+    function renderRecentRuns(rows) {
+      recentRunsTableBody.innerHTML = '';
+      rows.forEach((run) => {
+        const tr = document.createElement('tr');
+
+        const dangerText = typeof run.danger_score === 'number'
+          ? run.danger_score.toFixed(1)
+          : '-';
+        const lengthText = typeof run.length_m === 'number'
+          ? Math.round(run.length_m).toString()
+          : '-';
+        const snappingUsedText = run.snapping_used ? 'あり' : 'なし';
+        const snappingDistText = typeof run.snapping_distance_m === 'number'
+          ? run.snapping_distance_m.toFixed(1)
+          : '–';
+        const modeText = run.mode === 'vehicle' ? '車両センサーON' : 'GPSのみ';
+        const pointsText = typeof run.num_points === 'number' ? run.num_points.toString() : '–';
+
+        [
+          run.link_id,
+          dangerText,
+          lengthText,
+          snappingUsedText,
+          snappingDistText,
+          modeText,
+          pointsText,
+        ].forEach((val) => {
+          const td = document.createElement('td');
+          td.textContent = val ?? '-';
+          td.style.borderBottom = '1px solid #eee';
+          td.style.padding = '2px 4px';
+          tr.appendChild(td);
+        });
+
+        recentRunsTableBody.appendChild(tr);
+      });
+    }
+
+    async function loadRecentRuns(limit = 20) {
+      recentRunsStatusEl.textContent = '読み込み中…';
+      try {
+        const res = await fetch(`/api/collector/recent?limit=${limit}`);
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error('failed to load');
+        }
+        const runs = Array.isArray(data.runs) ? data.runs : [];
+        renderRecentRuns(runs);
+        recentRunsStatusEl.textContent = `直近 ${runs.length} 件を表示中`;
+      } catch (e) {
+        console.error(e);
+        recentRunsStatusEl.textContent = '一覧の取得に失敗しました。';
+      }
+    }
+
+    recentRunsBtn.addEventListener('click', () => {
+      loadRecentRuns();
+    });
+
+    async function toggleSensors(checked) {
+      if (checked) {
+        const ok = await sensorTracker.enable();
+        if (ok) {
+          sensorStatusEl.textContent = 'センサー計測中 (車両固定モード)';
+        } else {
+          sensorToggle.checked = false;
+          sensorStatusEl.textContent = 'センサー非対応、または許可が必要です';
+        }
+      } else {
+        sensorTracker.disable();
+        sensorStatusEl.textContent = 'センサーOFF（GPSのみ）';
+      }
+      updateSensorModeLabel();
+    }
+
+    sensorToggle.addEventListener('change', (e) => {
+      toggleSensors(e.target.checked);
+    });
+
+    // Initialize sensor status on load
+    sensorStatusEl.textContent = 'センサーOFF（GPSのみ）';
+    updateSensorModeLabel();
+
+    function haversineDistanceMeters(p1, p2) {
+      const R = 6371000;
+      const dLat = (p2.lat - p1.lat) * Math.PI / 180;
+      const dLon = (p2.lon - p1.lon) * Math.PI / 180;
+      const lat1 = p1.lat * Math.PI / 180;
+      const lat2 = p2.lat * Math.PI / 180;
+      const a = Math.sin(dLat/2) * Math.sin(dLat/2) + Math.sin(dLon/2) * Math.sin(dLon/2) * Math.cos(lat1) * Math.cos(lat2);
+      const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1-a));
+      return R * c;
+    }
+
+    function computeTrackLengthMeters(points) {
+      if (!Array.isArray(points) || points.length < 2) return 0;
+      let total = 0;
+      for (let i = 0; i < points.length - 1; i++) {
+        total += haversineDistanceMeters(points[i], points[i + 1]);
+      }
+      return Math.round(total);
+    }
+
+    startBtn.onclick = async () => {
+      resetRecording();
       statusEl.textContent = "GPS記録中...";
       startBtn.disabled = true;
-      stopBtn.disabled = false;
-      sendBtn.disabled = true;
+      stopSendBtn.disabled = false;
+      sensorTracker.startSession();
+      dangerRtTracker.reset();
+      resetDangerRtDisplay();
+      isRecording = true;
+      latestSpeedMps = null;
 
       if (!navigator.geolocation) {
         alert("この端末はGPSが使えません");
+        setStatus("GPS非対応");
+        startBtn.disabled = false;
+        stopSendBtn.disabled = true;
+        sensorTracker.stopSession();
+        isRecording = false;
+        await disableWakeLock();
         return;
       }
 
-      watchId = navigator.geolocation.watchPosition(
-        (pos) => {
-          const lat = pos.coords.latitude;
-          const lng = pos.coords.longitude;
-          points.push({ lat, lng });
+      try {
+        watchId = navigator.geolocation.watchPosition(
+          (pos) => {
+            const lat = pos.coords.latitude;
+            const lon = pos.coords.longitude;
+            const nowTs = Date.now();
+            let speedMps =
+              typeof pos.coords.speed === 'number' && !Number.isNaN(pos.coords.speed)
+                ? pos.coords.speed
+                : null;
+            if (speedMps === null && recordedPoints.length > 0) {
+              const prev = recordedPoints[recordedPoints.length - 1];
+              const dtSec = (nowTs - prev.timestamp_ms) / 1000;
+              if (dtSec > 0) {
+                const dist = haversineDistanceMeters(prev, { lat, lon });
+                speedMps = dist / dtSec;
+              }
+            }
+            latestSpeedMps = speedMps;
 
-          if (!polyline) {
-            polyline = L.polyline([[lat, lng]], { color: "blue" }).addTo(map);
-          } else {
-            polyline.addLatLng([lat, lng]);
+            const point = { lat, lon, timestamp_ms: nowTs, speed_mps: speedMps };
+            recordedPoints.push(point);
+            updatePointsCount();
+
+            if (!polyline) {
+              polyline = L.polyline([[lat, lon]], { color: "blue" }).addTo(map);
+            } else {
+              polyline.addLatLng([lat, lon]);
+            }
+
+            const dangerNow = dangerRtTracker.maybeUpdate(Date.now());
+            const dangerSummary = dangerRtTracker.getSummary();
+            updateDangerRtDisplay(dangerNow, dangerSummary.max);
+            renderRoughnessSparkline(dangerSummary.roughnessHistory);
+          },
+          (err) => {
+            console.error(err);
+            alert("位置情報が取得できません: " + err.message);
+            isRecording = false;
+            disableWakeLock();
+          },
+          {
+            enableHighAccuracy: true,
+            maximumAge: 0,
+            timeout: 10000,
           }
-        },
-        (err) => {
-          console.error(err);
-          alert("位置情報が取得できません: " + err.message);
-        },
-        {
-          enableHighAccuracy: true,
-          maximumAge: 1000,
-          timeout: 10000,
-        }
-      );
+        );
+        await enableWakeLock();
+      } catch (err) {
+        console.error('Failed to start geolocation watch', err);
+        alert('位置情報の取得を開始できませんでした');
+        isRecording = false;
+        await disableWakeLock();
+      }
     };
 
-    stopBtn.onclick = () => {
+    stopSendBtn.onclick = async () => {
       if (watchId !== null) {
         navigator.geolocation.clearWatch(watchId);
         watchId = null;
       }
-      statusEl.textContent = `記録停止：ポイント数 ${points.length}`;
-      startBtn.disabled = false;
-      stopBtn.disabled = true;
-      sendBtn.disabled = (points.length === 0);
-    };
 
-    sendBtn.onclick = async () => {
-      const width = parseFloat(document.getElementById("width").value);
-      const ground = parseInt(document.getElementById("ground").value, 10);
+      sensorTracker.stopSession();
+      isRecording = false;
+      await disableWakeLock();
 
-      const payload = {
-        coords: points,             // [{lat,lng}, ...]
-        width_m: width,
-        slope_deg: null,            // フェーズ2で拡張
-        curvature: null,
-        visibility: null,
-        ground_condition: ground
-      };
+      if (recordedPoints.length < 2) {
+        alert("2ポイント以上記録してから送信してください");
+        setStatus("記録が少なすぎます");
+        startBtn.disabled = false;
+        stopSendBtn.disabled = true;
+        return;
+      }
 
+      setStatus("送信中...");
+      const currentPoints = recordedPoints.slice();
+      const dangerSummary = dangerRtTracker.getSummary();
       try {
-        const res = await fetch("http://127.0.0.1:8000/api/roads", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(payload),
+        setError('');
+        const res = await fetch('/api/collector/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            points: recordedPoints,
+            sensor_summary: {
+              ...sensorTracker.getSummary(),
+              danger_rt_mean: dangerSummary.mean ?? null,
+              danger_rt_max: dangerSummary.max ?? null,
+            },
+            meta: { note: noteEl.value || undefined },
+          }),
         });
-        const data = await res.json();
-        console.log("登録結果:", data);
-        statusEl.textContent = `登録完了: link_id = ${data.link_id}`;
-        sendBtn.disabled = true;
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          throw new Error(data.detail || '送信に失敗しました');
+        }
+        setStatus(`送信完了。link_id=${data.link_id}, danger_score=${data.danger_score}`);
+        const snappedText = data.snapping_used ? 'あり' : 'なし';
+        const distance = computeTrackLengthMeters(currentPoints);
+        const modeText = sensorToggle.checked ? '車両センサーON' : 'GPSのみ';
+        const dangerText = typeof data.danger_score === 'number' ? data.danger_score.toFixed(1) : '-';
+        setLastResult(`直近の記録: link_id=${data.link_id}, 危険度=${dangerText}, 距離=${distance}m, スナップ=${snappedText}, モード=${modeText}`);
+        loadRecentRuns();
+        alert('送信しました');
+        resetRecording();
       } catch (e) {
         console.error(e);
-        statusEl.textContent = "送信エラー";
+        setStatus("送信エラー");
+        setError(e.message);
+        setLastResult('記録の送信に失敗しました。ネットワークを確認してください。');
       }
+
+      startBtn.disabled = false;
+      stopSendBtn.disabled = true;
+      sensorTracker.stopSession();
+      loadRecentRuns();
     };
   </script>
+
+  <!-- Self-review:
+       - /api/collector/submit に GPS ポイントを送信し、road_links に source='gps' で LINESTRING を挿入し、meta から danger_score を付与するようにした。
+       - collector.html にブラウザの geolocation API を使った Start/Stop ロガーと、API への送信処理を追加した。
+
+       Testing:
+       - ローカルで `uvicorn main:app --reload` を起動。
+       - ブラウザで `http://localhost:8000/collector` を開き、屋外 or 擬似位置情報で「記録開始」→少し移動→「記録停止＆送信」を実行。
+       - サーバのログで `/api/collector/submit` のリクエストが成功し、レスポンス JSON に `status: ok` と `danger_score` が含まれていることを確認。
+       - `/map` を開き、GPS レイヤー（青）の中に、新しいログの LINESTRING が描画されていることを確認。
+  -->
 </body>
 </html>
