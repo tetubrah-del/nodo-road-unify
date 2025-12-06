@@ -880,13 +880,21 @@ def list_unified_roads(
 
 
 @app.get("/api/road_segments_unified")
-def list_road_segments_unified(bbox: Optional[str] = None):
+def list_road_segments_unified(
+    min_lon: float | None = None,
+    min_lat: float | None = None,
+    max_lon: float | None = None,
+    max_lat: float | None = None,
+    limit: int = 5000,
+):
     where_clause = ""
-    params: Tuple[float, float, float, float] | Tuple[()] = tuple()
+    params: List[float] = []
 
-    if bbox:
-        params = _parse_bbox_param(bbox)
+    if None not in (min_lon, min_lat, max_lon, max_lat):
         where_clause = "WHERE ST_Intersects(geom, ST_MakeEnvelope(%s, %s, %s, %s, 4326))"
+        params.extend([min_lon, min_lat, max_lon, max_lat])  # type: ignore[arg-type]
+
+    params.append(limit)
 
     sql = f"""
         SELECT
@@ -901,11 +909,12 @@ def list_road_segments_unified(bbox: Optional[str] = None):
         FROM road_segments_unified
         {where_clause}
         ORDER BY segment_id
+        LIMIT %s
     """
 
     with get_connection() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(sql, params)
+            cur.execute(sql, tuple(params))
             rows = cur.fetchall()
 
     features = [
@@ -1511,7 +1520,16 @@ def map_page():
     }
 
     function loadSegments() {
-      fetch('/api/road_segments_unified')
+      const b = map.getBounds();
+      const params = new URLSearchParams({
+        min_lon: b.getWest(),
+        min_lat: b.getSouth(),
+        max_lon: b.getEast(),
+        max_lat: b.getNorth(),
+        limit: 5000,
+      });
+
+      fetch('/api/road_segments_unified?' + params.toString())
         .then(r => r.json())
         .then(data => {
           segmentsByLinkId = {};
@@ -1613,6 +1631,8 @@ def map_page():
       unifiedLayer.setZIndex(1);
       rawLayer.setZIndex(2);
       rawLayer.bringToFront();
+
+      loadSegments();
     }
 
     function addLegend() {
@@ -1711,7 +1731,6 @@ def map_page():
     addLegend();
     addDangerToggle();
     updateSegmentVisibility();
-    loadSegments();
     loadLayers();
   </script>
 </body>
