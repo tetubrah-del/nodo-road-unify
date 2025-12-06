@@ -33,11 +33,9 @@ from unify_multirun import unify_runs
 
 # Run: uvicorn main:app --reload
 
-PG_HOST = os.getenv("PG_HOST", "localhost")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB = os.getenv("PG_DB", "nodo")
-PG_USER = os.getenv("PG_USER", "nodo")
-PG_PASS = os.getenv("PG_PASS", "nodo_password")
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL is not set")
 
 
 app = FastAPI(title="Nodo Safety API")
@@ -60,13 +58,7 @@ def safe_dict(value):
 
 # === DB helpers ===
 def get_conn():
-    return psycopg2.connect(
-        host=PG_HOST,
-        port=PG_PORT,
-        dbname=PG_DB,
-        user=PG_USER,
-        password=PG_PASS,
-    )
+    return psycopg2.connect(DATABASE_URL)
 
 
 def get_connection():
