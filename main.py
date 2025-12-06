@@ -2,13 +2,15 @@ import json
 import math
 import os
 from pathlib import Path
-from typing import List, Literal, Optional
+from typing import List, Literal, Optional, Tuple
 
 import psycopg2
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, execute_batch
 from psycopg2.extensions import connection as PGConnection
+from shapely import wkt
+from shapely.geometry import LineString
 from pydantic import BaseModel, Field
 
 from danger_score_utils import compute_danger_score_v2
@@ -16,6 +18,15 @@ from danger_scoring import (
     DangerScoreParams,
     ReliabilityScoreParams,
     compute_danger_score_v4,
+)
+from geodesic_utils import polyline_length
+from segment_scoring import (
+    build_segment_geometries,
+    compute_local_geom_samples,
+    compute_local_intensities,
+    sample_link_geometry,
+    segment_link_by_intensity,
+    smooth_intensities,
 )
 import unify_multirun
 from unify_multirun import unify_runs
@@ -65,6 +76,24 @@ def get_connection():
 
 def _safe_mapping(value):
     return value if isinstance(value, dict) else None
+
+
+def ensure_segment_tables(conn: PGConnection) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            """
+            CREATE TABLE IF NOT EXISTS road_segments_unified (
+                segment_id      SERIAL PRIMARY KEY,
+                parent_link_id  INTEGER NOT NULL REFERENCES road_links_unified(link_id),
+                geom            GEOMETRY(LineString, 4326) NOT NULL,
+                start_frac      REAL NOT NULL,
+                end_frac        REAL NOT NULL,
+                length_m        REAL NOT NULL,
+                danger_v5       REAL,
+                metrics         JSONB
+            );
+            """
+        )
 
 
 def recompute_unified_danger_scores(
@@ -145,6 +174,137 @@ def recompute_unified_danger_scores(
             managed_conn.close()
 
     return updated
+
+
+def recompute_unified_danger_segments(
+    step_m: float = 5.0,
+    intensity_threshold: float = 0.4,
+    *,
+    slope_scale: float = 10.0,
+    curvature_scale: float = math.radians(45.0),
+    conn: PGConnection | None = None,
+) -> Tuple[int, int]:
+    """Recompute danger v5 segments for all unified links.
+
+    Returns (updated_links, written_segments).
+    """
+
+    managed_conn = conn or get_connection()
+    close_conn = conn is None
+    ensure_segment_tables(managed_conn)
+
+    written_segments = 0
+    updated_links = 0
+
+    try:
+        with managed_conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                """
+                SELECT link_id, ST_AsText(geom) AS wkt
+                FROM road_links_unified
+                """
+            )
+            rows = cur.fetchall()
+
+        for row in rows:
+            link_id = row.get("link_id")
+            geom_wkt = row.get("wkt")
+            if geom_wkt is None:
+                continue
+
+            try:
+                geom = wkt.loads(geom_wkt)
+            except Exception:
+                continue
+
+            if not isinstance(geom, LineString) or geom.is_empty:
+                continue
+
+            sampled = sample_link_geometry(geom, step_m)
+            local_samples = compute_local_geom_samples(sampled)
+            if not local_samples:
+                continue
+
+            fracs = [s.frac for s in local_samples]
+            intensities = compute_local_intensities(
+                local_samples,
+                slope_scale=slope_scale,
+                curvature_scale=curvature_scale,
+            )
+            smoothed = smooth_intensities(intensities)
+            segments = segment_link_by_intensity(
+                fracs, smoothed, threshold=intensity_threshold
+            )
+            if not segments:
+                continue
+
+            built_segments = build_segment_geometries(geom, segments)
+            if not built_segments:
+                continue
+
+            records = []
+            for seg, line in built_segments:
+                if line.is_empty or len(line.coords) < 2:
+                    continue
+                length_m = polyline_length(
+                    [{"lon": x, "lat": y} for x, y in line.coords]
+                )
+                if length_m <= 0:
+                    continue
+
+                danger_v5 = max(1.0, min(5.0, 1.0 + seg.intensity_mean * 4.0))
+                metrics = {
+                    "intensity_max": seg.intensity_max,
+                    "intensity_mean": seg.intensity_mean,
+                    "slope_scale": slope_scale,
+                    "curvature_scale": curvature_scale,
+                }
+
+                records.append(
+                    (
+                        link_id,
+                        line.wkt,
+                        seg.start_frac,
+                        seg.end_frac,
+                        length_m,
+                        danger_v5,
+                        json.dumps(metrics, ensure_ascii=False),
+                    )
+                )
+
+            if not records:
+                continue
+
+            with managed_conn.cursor() as cur:
+                cur.execute(
+                    "DELETE FROM road_segments_unified WHERE parent_link_id = %s",
+                    (link_id,),
+                )
+                insert_sql = """
+                    INSERT INTO road_segments_unified (
+                        parent_link_id,
+                        geom,
+                        start_frac,
+                        end_frac,
+                        length_m,
+                        danger_v5,
+                        metrics
+                    ) VALUES (
+                        %s,
+                        ST_SetSRID(ST_GeomFromText(%s), 4326),
+                        %s, %s, %s, %s, %s::jsonb
+                    )
+                """
+                execute_batch(cur, insert_sql, records, page_size=200)
+            managed_conn.commit()
+            written_segments += len(records)
+            updated_links += 1
+
+    finally:
+        if close_conn:
+            managed_conn.close()
+
+    return updated_links, written_segments
 
 
 # === Models (kept for compatibility) ===
@@ -505,6 +665,16 @@ def api_recompute_unified_danger_v3():
     reliability_params = ReliabilityScoreParams()
     updated = recompute_unified_danger_scores(danger_params, reliability_params)
     return {"updated": updated}
+
+
+@app.post("/api/admin/recompute_danger_segments")
+def api_recompute_danger_segments(
+    step_m: float = 5.0, intensity_threshold: float = 0.4
+):
+    updated_links, written_segments = recompute_unified_danger_segments(
+        step_m=step_m, intensity_threshold=intensity_threshold
+    )
+    return {"updated_links": updated_links, "written_segments": written_segments}
 
 
 @app.post("/api/unify/multirun")
