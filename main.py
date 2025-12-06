@@ -15,9 +15,7 @@ from danger_score_utils import compute_danger_score_v2
 from danger_scoring import (
     DangerScoreParams,
     ReliabilityScoreParams,
-    compute_danger_components,
-    compute_danger_score_v3,
-    compute_reliability_components,
+    compute_danger_score_v4,
 )
 import unify_multirun
 from unify_multirun import unify_runs
@@ -74,7 +72,7 @@ def recompute_unified_danger_scores(
     reliability_params: ReliabilityScoreParams | None = None,
     conn: PGConnection | None = None,
 ) -> int:
-    """Recompute danger_score_v3 for all unified links.
+    """Recompute danger_score (v4) for all unified links.
 
     Returns the number of rows updated.
     """
@@ -99,77 +97,31 @@ def recompute_unified_danger_scores(
         with managed_conn.cursor() as cur:
             for row in rows:
                 metadata = safe_dict(row.get("metadata"))
-                sensor_summary = _safe_mapping(metadata.get("sensor_summary"))
-                quality_info = _safe_mapping(metadata.get("quality")) or _safe_mapping(
-                    metadata.get("quality_info")
-                )
-
-                score, components = compute_danger_components(
-                    curvature=row.get("curvature"),
-                    slope_deg=row.get("slope_deg"),
-                    width_m=row.get("width_m"),
-                    sensor_summary=sensor_summary,
-                    quality_info=quality_info,
-                    params=danger_params,
-                )
-
-                multirun_summary = safe_dict(metadata.get("multirun_summary"))
-                alignment_stats = None
-                if multirun_summary:
-                    mean_cost = multirun_summary.get("alignment_cost_mean")
-                    max_cost = multirun_summary.get("alignment_cost_max")
-                    costs = multirun_summary.get("alignment_costs")
-                    if (mean_cost is None or max_cost is None) and isinstance(costs, list):
-                        numeric_costs = [
-                            float(c)
-                            for c in costs
-                            if isinstance(c, (int, float)) and not math.isinf(float(c))
-                        ]
-                        if numeric_costs:
-                            mean_cost = mean_cost if mean_cost is not None else sum(numeric_costs) / len(numeric_costs)
-                            max_cost = max_cost if max_cost is not None else max(numeric_costs)
-                    alignment_stats = {
-                        "mean_cost": mean_cost,
-                        "max_cost": max_cost,
-                    }
-
-                run_count = 0
-                if multirun_summary:
-                    run_count = multirun_summary.get("run_count") or 0
-                if not run_count:
-                    runs_field = metadata.get("runs") if isinstance(metadata, dict) else []
-                    if isinstance(runs_field, list):
-                        run_count = len(runs_field)
-                    if not run_count:
-                        run_count = int(metadata.get("num_runs") or 0)
-
-                sensor_mode_stats = None
-                if multirun_summary and isinstance(multirun_summary.get("sensor_modes"), dict):
-                    sensor_mode_stats = multirun_summary.get("sensor_modes")
-
-                hmm_info = safe_dict(metadata.get("hmm")) or safe_dict(
-                    metadata.get("hmm_summary")
-                )
-
-                reliability_score, reliability_components = compute_reliability_components(
-                    hmm_info=hmm_info,
-                    alignment_stats=alignment_stats,
-                    run_count=run_count,
-                    sensor_mode_stats=sensor_mode_stats,
-                    params=reliability_params,
-                )
-
-                metadata["danger_v3"] = {
-                    "score": score,
-                    "version": 3,
-                    "components": {
-                        "roughness": components.roughness,
-                        "curvature": components.curvature,
-                        "slope": components.slope,
-                        "width": components.width,
-                        "quality_penalty": components.quality_penalty,
-                    },
+                geom_features = {
+                    "curvature": row.get("curvature"),
+                    "slope_deg": row.get("slope_deg"),
+                    "width_m": row.get("width_m"),
                 }
+
+                score, breakdown = compute_danger_score_v4(
+                    geom_features=geom_features,
+                    metadata=metadata,
+                    params=danger_params,
+                    reliability_params=reliability_params,
+                )
+
+                reliability_score = breakdown.get("reliability", {}).get("raw")
+                reliability_components = breakdown.get("reliability", {}).get("components")
+
+                v3_breakdown = {
+                    "score": breakdown.get("v3_score"),
+                    "version": 3,
+                    "components": breakdown.get("geom", {}),
+                }
+
+                metadata.setdefault("danger", {})["v3"] = v3_breakdown
+                metadata["danger"].update({"v4": breakdown})
+                metadata["danger_v3"] = v3_breakdown
 
                 metadata["reliability"] = {
                     "score": reliability_score,
