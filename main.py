@@ -57,13 +57,9 @@ def safe_dict(value):
 
 
 # === DB helpers ===
-def get_conn():
-    return psycopg2.connect(DATABASE_URL)
-
-
 def get_connection():
-    """PostGIS へのコネクションを返すヘルパー"""
-    return get_conn()
+    """Return a connection to the PostGIS database."""
+    return psycopg2.connect(DATABASE_URL)
 
 
 def _safe_mapping(value):
