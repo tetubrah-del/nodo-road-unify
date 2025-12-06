@@ -96,6 +96,15 @@ def test_unified_roads_feature_collection(client):
     assert isinstance(body.get("features"), list)
 
 
+def test_road_segments_feature_collection(client):
+    response = client.get("/api/road_segments_unified")
+    body = response.json()
+
+    assert response.status_code == 200
+    assert body.get("type") == "FeatureCollection"
+    assert isinstance(body.get("features"), list)
+
+
 def test_multirun_unify_endpoint(client):
     response = client.post("/api/unify/multirun", json={"link_ids": [1, 2, 3]})
     body = response.json()

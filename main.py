@@ -783,6 +783,17 @@ def _build_unified_feature(row: dict) -> dict:
     }
 
 
+def _parse_bbox_param(bbox: str) -> Tuple[float, float, float, float]:
+    parts = bbox.split(",")
+    if len(parts) != 4:
+        raise HTTPException(status_code=400, detail="bbox must have 4 comma-separated numbers")
+
+    try:
+        return tuple(map(float, parts))  # type: ignore[return-value]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="bbox values must be numbers")
+
+
 @app.get("/api/roads")
 def list_roads(
     min_lon: float,
@@ -866,6 +877,55 @@ def list_unified_roads(
         "type": "FeatureCollection",
         "features": [_build_unified_feature(r) for r in rows],
     }
+
+
+@app.get("/api/road_segments_unified")
+def list_road_segments_unified(bbox: Optional[str] = None):
+    where_clause = ""
+    params: Tuple[float, float, float, float] | Tuple[()] = tuple()
+
+    if bbox:
+        params = _parse_bbox_param(bbox)
+        where_clause = "WHERE ST_Intersects(geom, ST_MakeEnvelope(%s, %s, %s, %s, 4326))"
+
+    sql = f"""
+        SELECT
+            segment_id,
+            parent_link_id,
+            danger_v5,
+            start_frac,
+            end_frac,
+            length_m,
+            metrics,
+            ST_AsGeoJSON(geom)::json AS geom
+        FROM road_segments_unified
+        {where_clause}
+        ORDER BY segment_id
+    """
+
+    with get_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(sql, params)
+            rows = cur.fetchall()
+
+    features = [
+        {
+            "type": "Feature",
+            "geometry": row.get("geom"),
+            "properties": {
+                "segment_id": row.get("segment_id"),
+                "parent_link_id": row.get("parent_link_id"),
+                "danger_v5": row.get("danger_v5"),
+                "start_frac": row.get("start_frac"),
+                "end_frac": row.get("end_frac"),
+                "length_m": row.get("length_m"),
+                "metrics": safe_dict(row.get("metrics")),
+            },
+        }
+        for row in rows
+    ]
+
+    return {"type": "FeatureCollection", "features": features}
 
 
 @app.post("/api/collector/submit")
@@ -1185,6 +1245,7 @@ def map_page():
     let rawLayer = null;
     let unifiedLayer = null;
     let gpsRawLayer = L.layerGroup();
+    const segmentLayer = L.layerGroup().addTo(map);
     let layerControl = null;
     let dangerMode = false;
 
@@ -1236,6 +1297,14 @@ def map_page():
       if (score < 4) return '#ffcc00';     // 中リスク: 黄
       if (score < 6) return '#ff8800';     // 高リスク: オレンジ
       return '#ff0000';                    // 非常に危険: 赤
+    }
+
+    function dangerV5Color(score) {
+      if (score == null) return '#888888';
+      if (score < 2.0) return '#00b050';   // safe (green)
+      if (score < 3.5) return '#ffc000';   // caution (yellow)
+      if (score < 4.3) return '#ed7d31';   // dangerous (orange)
+      return '#c00000';                    // very dangerous (red)
     }
 
     function unifiedStyle(feature) {
@@ -1355,6 +1424,42 @@ def map_page():
       L.geoJSON(rawFeature, { style: gpsRawStyle }).addTo(gpsRawLayer);
     }
 
+    function loadSegments() {
+      fetch('/api/road_segments_unified')
+        .then(r => r.json())
+        .then(data => {
+          segmentLayer.clearLayers();
+          L.geoJSON(data, {
+            style: feature => ({
+              color: dangerV5Color(feature.properties?.danger_v5),
+              weight: 6,
+              opacity: 0.9
+            }),
+            onEachFeature: (feature, layer) => {
+              const p = feature.properties || {};
+              const score = p.danger_v5 != null ? p.danger_v5.toFixed(2) : 'n/a';
+              layer.bindPopup([
+                `<b>Danger v5:</b> ${score}`,
+                `<b>Length:</b> ${Math.round(p.length_m || 0)} m`,
+                `<b>Link:</b> ${p.parent_link_id}`,
+                `<b>Frac:</b> ${(p.start_frac ?? 0).toFixed(2)} – ${(p.end_frac ?? 0).toFixed(2)}`
+              ].join('<br/>'));
+            },
+          }).addTo(segmentLayer);
+        })
+        .catch(err => console.error('loadSegments error', err));
+    }
+
+    function updateSegmentVisibility() {
+      if (dangerMode) {
+        if (!map.hasLayer(segmentLayer)) {
+          map.addLayer(segmentLayer);
+        }
+      } else if (map.hasLayer(segmentLayer)) {
+        map.removeLayer(segmentLayer);
+      }
+    }
+
     async function loadLayers() {
       const b = map.getBounds();
       const params = new URLSearchParams({
@@ -1445,6 +1550,22 @@ def map_page():
             <span>Danger: 非常に危険（赤）</span>
           </div>
           <div class="legend-item">
+            <span class="legend-line" style="background:#00b050"></span>
+            <span>Segment v5: 安全（緑）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#ffc000"></span>
+            <span>Segment v5: 注意（黄）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#ed7d31"></span>
+            <span>Segment v5: 危険（オレンジ）</span>
+          </div>
+          <div class="legend-item">
+            <span class="legend-line" style="background:#c00000"></span>
+            <span>Segment v5: 非常に危険（赤）</span>
+          </div>
+          <div class="legend-item">
             <span class="legend-line" style="background:#000000"></span>
             <span>Danger: 未設定（黒）</span>
           </div>
@@ -1474,6 +1595,7 @@ def map_page():
         label.appendChild(document.createTextNode('Danger mode'));
         checkbox.addEventListener('change', (e) => {
           dangerMode = e.target.checked;
+          updateSegmentVisibility();
           loadLayers();
         });
         L.DomEvent.disableClickPropagation(div);
@@ -1485,6 +1607,8 @@ def map_page():
     map.on('moveend', loadLayers);
     addLegend();
     addDangerToggle();
+    updateSegmentVisibility();
+    loadSegments();
     loadLayers();
   </script>
 </body>
