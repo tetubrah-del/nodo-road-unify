@@ -3,7 +3,12 @@ import json
 import pytest
 
 import main
-from danger_scoring import DangerScoreParams, compute_danger_score_v3
+from danger_scoring import (
+    DangerScoreParams,
+    ReliabilityScoreParams,
+    compute_danger_score_v3,
+    compute_danger_score_v4,
+)
 
 
 class DummyCursor:
@@ -129,7 +134,95 @@ def test_recompute_unified_danger_scores_updates_rows(monkeypatch):
 
     assert updated == 1
     assert rows[0].get("danger_score") is not None
-    assert rows[0]["metadata"].get("danger_v3", {}).get("score") == rows[0][
-        "danger_score"
-    ]
+    assert rows[0]["metadata"].get("danger_v3", {}).get("score") is not None
+    assert rows[0]["metadata"].get("danger", {}).get("v4") is not None
     assert dummy_conn.committed is True
+
+
+def test_danger_score_v4_with_sensor_increase():
+    params = DangerScoreParams()
+    geom = {"curvature": 0.001, "slope_deg": 2.0, "width_m": 3.0}
+
+    base_score, _ = compute_danger_score_v4(
+        geom_features=geom,
+        metadata={"sensor_summary": {}},
+        params=params,
+        reliability_params=ReliabilityScoreParams(),
+    )
+
+    sensor_metadata = {
+        "sensor_summary": {
+            "jerk_rms": 2.0,
+            "jerk_max_abs": 3.0,
+            "pitch_smooth_std": 4.0,
+            "danger_rt_max": 5.0,
+        }
+    }
+    sensor_score, _ = compute_danger_score_v4(
+        geom_features=geom,
+        metadata=sensor_metadata,
+        params=params,
+        reliability_params=ReliabilityScoreParams(),
+    )
+
+    assert sensor_score > base_score
+
+
+def test_danger_score_v4_reliability_effect():
+    params = DangerScoreParams()
+    geom = {"curvature": 0.001, "slope_deg": 2.0, "width_m": 3.0}
+
+    high_rel_metadata = {"reliability": {"score": 0.9}, "sensor_summary": {}}
+    low_rel_metadata = {"reliability": {"score": 0.1}, "sensor_summary": {}}
+
+    high_score, _ = compute_danger_score_v4(
+        geom_features=geom,
+        metadata=high_rel_metadata,
+        params=params,
+        reliability_params=ReliabilityScoreParams(),
+    )
+    low_score, _ = compute_danger_score_v4(
+        geom_features=geom,
+        metadata=low_rel_metadata,
+        params=params,
+        reliability_params=ReliabilityScoreParams(),
+    )
+
+    assert low_score > high_score
+
+
+def test_danger_score_v4_handles_missing_metadata():
+    params = DangerScoreParams()
+    geom = {"curvature": 0.0, "slope_deg": 0.0, "width_m": 4.0}
+
+    score, breakdown = compute_danger_score_v4(
+        geom_features=geom,
+        metadata={},
+        params=params,
+        reliability_params=ReliabilityScoreParams(),
+    )
+
+    assert 1.0 <= score <= 5.0
+    assert breakdown["sensor"]["raw"] == {
+        "jerk_rms": None,
+        "jerk_max_abs": None,
+        "pitch_smooth_std": None,
+        "pitch_smooth_range": None,
+        "danger_rt_mean": None,
+        "danger_rt_max": None,
+    }
+
+
+def test_danger_score_v4_clamped_range():
+    params = DangerScoreParams()
+    geom = {"curvature": 10.0, "slope_deg": 90.0, "width_m": 0.5}
+    metadata = {"sensor_summary": {"jerk_rms": 100.0, "jerk_max_abs": 100.0}}
+
+    score, _ = compute_danger_score_v4(
+        geom_features=geom,
+        metadata=metadata,
+        params=params,
+        reliability_params=ReliabilityScoreParams(),
+    )
+
+    assert 1.0 <= score <= 5.0
