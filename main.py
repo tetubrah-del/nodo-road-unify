@@ -1247,6 +1247,7 @@ def map_page():
     let gpsRawLayer = L.layerGroup();
     const segmentLayer = L.layerGroup().addTo(map);
     const unifiedLayerById = new Map();
+    let segmentsByLinkId = {};
     let hoveredSegment = null;
     let hoveredUnified = null;
     let layerControl = null;
@@ -1310,6 +1311,14 @@ def map_page():
       return '#c00000';                    // very dangerous (red)
     }
 
+    function segmentDangerLabel(score) {
+      if (score == null) return { label: 'Unknown', color: '#888888' };
+      if (score < 2.0) return { label: 'Safe', color: '#00b050' };
+      if (score < 3.5) return { label: 'Caution', color: '#ffc000' };
+      if (score < 4.3) return { label: 'Dangerous', color: '#ed7d31' };
+      return { label: 'Highly Dangerous', color: '#c00000' };
+    }
+
     function highlightSegment(layer) {
       layer.setStyle({ weight: 8, opacity: 1.0 });
     }
@@ -1345,64 +1354,67 @@ def map_page():
       return { color, weight: 5, opacity: 0.9, lineJoin: 'round', lineCap: 'round' };
     }
 
+    function buildDangerPopup(linkProps) {
+      const meta = linkProps?.metadata || {};
+      const dangerMeta = meta.danger || {};
+      const reliability = meta.reliability || {};
+      const dangerV4 = (dangerMeta.v4 && dangerMeta.v4.score) ?? linkProps?.danger_score;
+      const reliabilityComponents = reliability.components || {};
+      const segments = segmentsByLinkId[linkProps?.link_id] || [];
+
+      const summaryHtml = [
+        `<div><b>Unified link ${linkProps?.link_id ?? '-'}</b></div>`,
+        `<div>Length: ${linkProps?.length_m != null ? `${Math.round(linkProps.length_m)} m` : '-'}</div>`,
+        `<div>Danger v4: ${dangerV4 != null ? `${Number(dangerV4).toFixed(1)} / 5.0` : '-'}</div>`,
+      ];
+
+      if (typeof reliability.score === 'number') {
+        summaryHtml.push(`<div>Reliability: ${reliability.score.toFixed(2)}</div>`);
+      }
+      if (reliabilityComponents && Object.keys(reliabilityComponents).length > 0) {
+        const comps = Object.entries(reliabilityComponents)
+          .map(([k, v]) => `<li>${k}: ${typeof v === 'number' ? v.toFixed(3) : v}</li>`)
+          .join('');
+        summaryHtml.push(`<ul style="margin:4px 0 0 16px;">${comps}</ul>`);
+      }
+
+      const segmentItems = segments
+        .slice()
+        .sort((a, b) => (a.start_frac ?? 0) - (b.start_frac ?? 0))
+        .map((seg, idx) => {
+          const { label, color } = segmentDangerLabel(seg.danger_v5);
+          const lengthText = seg.length_m != null ? `${Math.round(seg.length_m)} m` : '-';
+          const dangerText = seg.danger_v5 != null ? seg.danger_v5.toFixed(2) : 'n/a';
+          return `<li style="margin-bottom:4px;">`
+            + `<span style="display:inline-block;width:12px;height:12px;background:${color};margin-right:6px;border-radius:2px;"></span>`
+            + `Seg ${idx + 1}: ${lengthText} — ${dangerText} (${label})`
+            + `</li>`;
+        })
+        .join('');
+
+      const segmentsHtml = segmentItems
+        ? `<ul style="padding-left:16px; margin:4px 0 0 0;">${segmentItems}</ul>`
+        : '<div>No segment data</div>';
+
+      return [
+        '<div style="line-height:1.4;">',
+        summaryHtml.join(''),
+        '<hr style="margin:8px 0;">',
+        '<div><b>Segment danger breakdown (v5)</b></div>',
+        segmentsHtml,
+        '</div>',
+      ].join('');
+    }
+
     function bindUnifiedPopup(layer, p) {
       const meta = p.metadata || {};
       const gpsStats = meta.gps_stats || {};
       const hmm = meta.hmm || {};
 
-      const html = [
-        `<b>Unified link ${p.link_id}</b>`,
-        `Sources: ${formatList(p.sources)}`,
-        `Parents: ${formatList(p.parent_link_ids)}`,
-        `Width: ${formatNumber(p.width_m, ' m')}`,
-        `Slope: ${formatNumber(p.slope_deg, '°')}`,
-        `Curvature: ${formatNumber(p.curvature)}`,
-        `Visibility: ${formatNumber(p.visibility)}`,
-        `Ground: ${groundLabel(p.ground_condition)}`,
-        `Danger score: ${p.danger_score ?? '-'}`
-      ].join('<br>');
-
-      let gpsHtml = '';
-      const hasGpsStats = gpsStats && (
-        typeof gpsStats.count === 'number'
-        || typeof gpsStats.avg_danger === 'number'
-        || typeof gpsStats.last_danger === 'number'
-      );
-
-      if (hasGpsStats) {
-        gpsHtml += '<hr>';
-        gpsHtml += '<b>GPS stats</b><br>';
-        if (typeof gpsStats.count === 'number') {
-          gpsHtml += `Runs: ${gpsStats.count}<br>`;
-        }
-        if (typeof gpsStats.avg_danger === 'number') {
-          gpsHtml += `Avg danger: ${gpsStats.avg_danger.toFixed(2)}<br>`;
-        }
-        if (typeof gpsStats.last_danger === 'number') {
-          gpsHtml += `Last danger: ${gpsStats.last_danger.toFixed(2)}<br>`;
-        }
-      }
-
-      let hmmHtml = '';
-      if (hmm && hmm.enabled) {
-        hmmHtml += '<hr>';
-        hmmHtml += '<b>HMM (debug)</b><br>';
-        const matchedId = hmm.matched_link_id !== null && hmm.matched_link_id !== undefined
-          ? hmm.matched_link_id
-          : '-';
-        hmmHtml += `Matched link: ${matchedId}<br>`;
-        if (typeof hmm.matched_ratio === 'number') {
-          hmmHtml += `Matched ratio: ${(hmm.matched_ratio * 100).toFixed(1)}%<br>`;
-        }
-        if (typeof hmm.avg_emission_prob === 'number') {
-          hmmHtml += `Avg emission: ${hmm.avg_emission_prob.toFixed(3)}<br>`;
-        }
-        if (typeof hmm.log_likelihood === 'number') {
-          hmmHtml += `Log likelihood: ${hmm.log_likelihood.toFixed(2)}<br>`;
-        }
-      }
-
-      layer.bindPopup(html + gpsHtml + hmmHtml);
+      layer.on('click', () => {
+        const html = buildDangerPopup(p);
+        layer.bindPopup(html).openPopup();
+      });
     }
 
     function bindRawPopup(layer, p) {
@@ -1485,10 +1497,38 @@ def map_page():
       });
     }
 
+    function attachSegmentClickHandler(feature, layer) {
+      const parentId = feature.properties?.parent_link_id;
+      layer.on('click', (e) => {
+        if (parentId == null) return;
+        const unified = unifiedLayerById.get(parentId);
+        const props = unified?.feature?.properties;
+        if (!props) return;
+        const html = buildDangerPopup(props);
+        const targetLayer = unified || layer;
+        targetLayer.bindPopup(html).openPopup(e.latlng);
+      });
+    }
+
     function loadSegments() {
       fetch('/api/road_segments_unified')
         .then(r => r.json())
         .then(data => {
+          segmentsByLinkId = {};
+          const features = data?.features || [];
+          features.forEach((f) => {
+            const p = f.properties || {};
+            const parentId = p.parent_link_id;
+            if (parentId == null) return;
+            if (!segmentsByLinkId[parentId]) {
+              segmentsByLinkId[parentId] = [];
+            }
+            segmentsByLinkId[parentId].push(p);
+          });
+          Object.keys(segmentsByLinkId).forEach((key) => {
+            segmentsByLinkId[key].sort((a, b) => (a.start_frac ?? 0) - (b.start_frac ?? 0));
+          });
+
           segmentLayer.clearLayers();
           L.geoJSON(data, {
             style: feature => ({
@@ -1498,14 +1538,7 @@ def map_page():
             }),
             onEachFeature: (feature, layer) => {
               attachSegmentHoverHandlers(feature, layer);
-              const p = feature.properties || {};
-              const score = p.danger_v5 != null ? p.danger_v5.toFixed(2) : 'n/a';
-              layer.bindPopup([
-                `<b>Danger v5:</b> ${score}`,
-                `<b>Length:</b> ${Math.round(p.length_m || 0)} m`,
-                `<b>Link:</b> ${p.parent_link_id}`,
-                `<b>Frac:</b> ${(p.start_frac ?? 0).toFixed(2)} – ${(p.end_frac ?? 0).toFixed(2)}`
-              ].join('<br/>'));
+              attachSegmentClickHandler(feature, layer);
             },
           }).addTo(segmentLayer);
         })
