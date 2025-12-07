@@ -1,12 +1,13 @@
 import json
 import math
 import os
+import uuid
 from pathlib import Path
 from typing import List, Literal, Optional, Tuple
 
 import psycopg2
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from psycopg2.extras import RealDictCursor, execute_batch
 from psycopg2.extensions import connection as PGConnection
 from shapely import wkt
@@ -356,6 +357,7 @@ class CollectorSensorSummary(BaseModel):
 
 
 class CollectorRequest(BaseModel):
+    run_id: Optional[str] = None
     points: List[CollectorPoint]
     meta: CollectorMeta = Field(default_factory=CollectorMeta)
     sensor_summary: Optional[CollectorSensorSummary] = None
@@ -930,12 +932,40 @@ def collector_submit(payload: CollectorRequest):
     if not payload.points or len(payload.points) < 2:
         raise HTTPException(status_code=400, detail="At least 2 points are required")
 
+    run_id = payload.run_id or str(uuid.uuid4())
     smoothed_points = _smooth_collector_points(payload.points)
 
     raw_wkt = _build_linestring_wkt(smoothed_points)
     metadata = _build_collector_metadata(payload, smoothed_points=smoothed_points)
+    metadata.setdefault("collector", {})["run_id"] = run_id
 
     with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("ALTER TABLE road_links ADD COLUMN IF NOT EXISTS run_id TEXT;")
+            cur.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS road_links_run_id_uidx
+                ON road_links (run_id);
+                """
+            )
+
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute(
+                "SELECT link_id, danger_score, metadata FROM road_links WHERE run_id = %s",
+                (run_id,),
+            )
+            existing = cur.fetchone()
+            if existing:
+                collector_meta = safe_dict(existing.get("metadata", {})).get("collector", {})
+                snapping_used = bool(safe_dict(collector_meta).get("snapping_used"))
+                return {
+                    "status": "already_processed",
+                    "link_id": existing.get("link_id"),
+                    "danger_score": existing.get("danger_score"),
+                    "snapping_used": snapping_used,
+                    "run_id": run_id,
+                }
+
         snapped_wkt = snap_linestring_to_unified_roads(conn, raw_wkt)
         wkt_to_use = snapped_wkt or raw_wkt
 
@@ -980,12 +1010,14 @@ def collector_submit(payload: CollectorRequest):
                     visibility,
                     ground_condition,
                     danger_score,
-                    metadata
+                    metadata,
+                    run_id
                 )
                 VALUES (
                     ST_GeomFromText(%s, 4326),
                     %s, %s, %s, %s, %s, %s, %s,
-                    %s::jsonb
+                    %s::jsonb,
+                    %s
                 )
                 RETURNING link_id, danger_score;
                 """,
@@ -999,6 +1031,7 @@ def collector_submit(payload: CollectorRequest):
                     payload.meta.ground_condition,
                     danger_score,
                     json.dumps(metadata, ensure_ascii=False),
+                    run_id,
                 ),
             )
             row = cur.fetchone()
@@ -1011,7 +1044,7 @@ def collector_submit(payload: CollectorRequest):
 
     print(
         f"[collector] points={len(payload.points)} danger_score={danger_score} "
-        f"link_id={row['link_id']}"
+        f"link_id={row['link_id']} run_id={run_id}"
     )
 
     return {
@@ -1019,6 +1052,7 @@ def collector_submit(payload: CollectorRequest):
         "link_id": row["link_id"],
         "danger_score": row["danger_score"],
         "snapping_used": bool(metadata.get("collector", {}).get("snapping_used")),
+        "run_id": run_id,
     }
 
 
@@ -1728,6 +1762,14 @@ def map_page():
 
 
 BASE_DIR = Path(__file__).resolve().parent
+
+
+@app.get("/sw-collector.js")
+def collector_service_worker():
+    sw_path = BASE_DIR / "app" / "sw-collector.js"
+    if not sw_path.exists():
+        raise HTTPException(status_code=404, detail="Service worker not found")
+    return FileResponse(sw_path, media_type="application/javascript")
 
 
 @app.get("/collector", response_class=HTMLResponse)
